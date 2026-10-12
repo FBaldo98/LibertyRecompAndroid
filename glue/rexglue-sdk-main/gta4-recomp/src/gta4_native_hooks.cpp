@@ -7555,7 +7555,14 @@ extern "C" void sub_826273A0(PPCContext& ctx, uint8_t* base) {
   }
 }
 
+#if defined(__ANDROID__)
+extern "C" void liberty_android_frame_presented();
+#endif
+
 extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
+#if defined(__ANDROID__)
+  liberty_android_frame_presented();
+#endif
   if (!IsNativeMode()) {
     __imp__sub_82A467D8(ctx, base);
     return;

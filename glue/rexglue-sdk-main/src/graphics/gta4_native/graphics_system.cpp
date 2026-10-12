@@ -3233,6 +3233,10 @@ struct Gta4NativeGraphicsSystem::NativePipelineCompilerState {
   std::atomic<uint64_t> shader_generation{1};
   uint64_t replay_scanned_generation = 0;
   bool replay_retry = false;
+  // Saved recipes handed to the compiler so far, and the count last logged.
+  size_t replay_queued = 0;
+  size_t replay_reported = 0;
+  uint64_t replay_report_tick = 0;
   std::atomic<uint64_t> checkpoint_tick{0};
   static constexpr size_t kMaximumRecipes = 4096;
 };
@@ -16642,7 +16646,10 @@ void Gta4NativeGraphicsSystem::ScheduleNativePipelineCheckpoint() {
   }
   const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
   const uint64_t previous = native_pipeline_compiler_->checkpoint_tick.load();
-  if (now < previous || (now - previous) / rex::chrono::Clock::QueryHostTickFrequency() < 30) {
+  // Every five seconds; the save returns at once when nothing was compiled.
+  // At 30 a short session lost most of what it had learned: Android stops
+  // the game without a clean shutdown, so the last interval is never saved.
+  if (now < previous || (now - previous) / rex::chrono::Clock::QueryHostTickFrequency() < 5) {
     return;
   }
   native_pipeline_compiler_->writer->TakeCompleted();
@@ -16690,6 +16697,8 @@ void Gta4NativeGraphicsSystem::LoadNativePipelineRecipes() {
       }
     }
   }
+  REXLOG_INFO("gta4-native: pipeline recipes loaded {} of {} saved",
+              native_pipeline_compiler_->replay.size(), header.count);
 }
 
 void Gta4NativeGraphicsSystem::ReplayNativePipelineRecipes() {
@@ -16698,6 +16707,17 @@ void Gta4NativeGraphicsSystem::ReplayNativePipelineRecipes() {
   }
   DrainNativePipelineCompiles();
   auto& state = *native_pipeline_compiler_;
+  // At most one line every five seconds: a boot registers over a thousand
+  // shaders and each registration runs a pass.
+  if (state.replay_queued != state.replay_reported) {
+    const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    if ((now - state.replay_report_tick) / rex::chrono::Clock::QueryHostTickFrequency() >= 5) {
+      REXLOG_INFO("gta4-native: queued {} saved pipelines for prebuilding, {} wait for a shader",
+                  state.replay_queued, state.replay.size());
+      state.replay_reported = state.replay_queued;
+      state.replay_report_tick = now;
+    }
+  }
   // Recipes still waiting are missing a shader: nothing can change for them
   // until a shader registers or the compile queue has room again.
   const uint64_t shader_generation = state.shader_generation.load(std::memory_order_relaxed);
@@ -16808,6 +16828,7 @@ void Gta4NativeGraphicsSystem::ReplayNativePipelineRecipes() {
         state.records.emplace(key, recipe.data);
       }
     }
+    ++state.replay_queued;
     it = state.replay.erase(it);
   }
 }

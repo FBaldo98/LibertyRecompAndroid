@@ -869,7 +869,21 @@ bool Presenter::RefreshGuestOutput(
         paint_result_name(paint_result));
   }
   }
+  // A producer slower than the limit needs no holding back, and the wait is
+  // not free: it lasts until the host present of this frame, during which the
+  // producer cannot start the next one. On a clock-limited OPPO CPH2765 that
+  // took a scene from 26 to 20 FPS under a 60 FPS limit.
+  bool producer_behind_limit = false;
+  if (is_active) {
+    const uint64_t now_ns = FramePacerNowNs();
+    if (provenance.frame_rate_limit && !paired_presentation && last_paced_publication_ns_) {
+      const uint64_t period_ns = FramePacer::kSecond / provenance.frame_rate_limit;
+      producer_behind_limit = now_ns - last_paced_publication_ns_ > period_ns + period_ns / 8;
+    }
+    last_paced_publication_ns_ = now_ns;
+  }
   if (is_active && provenance.producer_backpressure && (provenance.frame_rate_limit || paired_presentation) &&
+      !producer_behind_limit &&
       std::this_thread::get_id() != ui_thread_id_ &&
       paint_result != PaintResult::kGpuLostResponsible &&
       paint_result != PaintResult::kGpuLostExternally) {

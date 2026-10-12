@@ -53,6 +53,7 @@
 #include <sched.h>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #endif
 
@@ -820,27 +821,69 @@ void StartThermalLog() {
       std::getline(file, value);
       return value.empty() ? std::string("?") : value;
     };
+    // Android's own view of throttling tells heat from a vendor power policy:
+    // a clock limit with status 0 and headroom well under 1 is not thermal.
+    // The API is Android 11's (headroom Android 12's) and the library builds
+    // against API 28, so it is looked up at run time.
+    void* android_library = dlopen("libandroid.so", RTLD_NOW);
+    const auto find = [android_library](const char* name) {
+      return android_library ? dlsym(android_library, name) : nullptr;
+    };
+    const auto acquire_manager = reinterpret_cast<void* (*)()>(find("AThermal_acquireManager"));
+    const auto get_status =
+        reinterpret_cast<int32_t (*)(void*)>(find("AThermal_getCurrentThermalStatus"));
+    const auto get_headroom =
+        reinterpret_cast<float (*)(void*, int)>(find("AThermal_getThermalHeadroom"));
+    void* thermal_manager = acquire_manager ? acquire_manager() : nullptr;
     for (;;) {
       std::this_thread::sleep_for(std::chrono::seconds(5));
       if (!REXCVAR_GET(android_thermal_log)) continue;
+      // Status: 0 none, 1 light, 2 moderate, 3 severe, 4 critical and up.
+      // Headroom: 1.0 is the temperature at which severe throttling starts.
+      char android_thermal[48] = "?";
+      if (thermal_manager && get_status) {
+        std::snprintf(android_thermal, sizeof(android_thermal), "%d/%.2f",
+                      int(get_status(thermal_manager)),
+                      get_headroom ? double(get_headroom(thermal_manager, 0)) : -1.0);
+      }
       const std::string kgsl = "/sys/class/kgsl/kgsl-3d0/";
+      // Every core, grouped where neighbours agree: "0-5:1113600/3628800" is
+      // the clock limit over the hardware maximum. Three fixed cores missed
+      // the SM8850's prime pair (cpu6-7), which read "?" on an OPPO CPH2765.
       std::string cpu_limits;
-      for (int cpu : {0, 4, 7}) {
-        cpu_limits += read(("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
-                            "/cpufreq/scaling_max_freq").c_str());
-        cpu_limits += cpu == 7 ? "" : "/";
+      std::string group_state;
+      int group_first = 0;
+      const int cpu_count = int(sysconf(_SC_NPROCESSORS_CONF));
+      for (int cpu = 0; cpu <= cpu_count; ++cpu) {
+        std::string state;
+        if (cpu < cpu_count) {
+          const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+          state = read((base + "/online").c_str()) == "0"
+                      ? "offline"
+                      : read((base + "/cpufreq/scaling_max_freq").c_str()) + "/" +
+                            read((base + "/cpufreq/cpuinfo_max_freq").c_str());
+        }
+        if (cpu && state != group_state) {
+          if (!cpu_limits.empty()) cpu_limits += ' ';
+          cpu_limits += std::to_string(group_first);
+          if (cpu - 1 > group_first) cpu_limits += "-" + std::to_string(cpu - 1);
+          cpu_limits += ":" + group_state;
+          group_first = cpu;
+        }
+        group_state = std::move(state);
       }
       // Guest threads spinning on yields (pinyon-shift found a title loop that
       // gave up after 1000 of them, which return at once on the host).
       const std::string yields = rex::kernel::xboxkrnl::TakeYieldCountSummary(4);
       __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp",
                           "thermal: gpu-level=%s gpu-max=%s gpu-clk=%s gpu-busy=%s gpu-temp=%s "
-                          "cpu-max-khz=%s yields/spins-5s=%s",
+                          "android-status/headroom=%s cpu-max-khz=%s yields/spins-5s=%s",
                           read((kgsl + "thermal_pwrlevel").c_str()).c_str(),
                           read((kgsl + "max_gpuclk").c_str()).c_str(),
                           read((kgsl + "gpuclk").c_str()).c_str(),
                           read((kgsl + "gpu_busy_percentage").c_str()).c_str(),
-                          read((kgsl + "temp").c_str()).c_str(), cpu_limits.c_str(),
+                          read((kgsl + "temp").c_str()).c_str(), android_thermal,
+                          cpu_limits.c_str(),
                           yields.empty() ? "none" : yields.c_str());
     }
   }).detach();

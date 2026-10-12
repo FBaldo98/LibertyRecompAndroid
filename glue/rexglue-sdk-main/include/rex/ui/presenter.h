@@ -1073,6 +1073,8 @@ class Presenter {
   FramePacer frame_pacer_;  // Existing exclusive paint owner.
   FramePacer::Attempt pacing_attempt_{};
   FramePublicationGate frame_publication_gate_;
+  // Accessible only by refreshing: when the previous frame was published.
+  uint64_t last_paced_publication_ns_ = 0;
   const std::thread::id ui_thread_id_ = std::this_thread::get_id();
   std::atomic<uint64_t> paint_retry_delay_ns_{1'000'000};
   uint64_t host_rate_trace_count_ = 0;

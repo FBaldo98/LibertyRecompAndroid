@@ -25,7 +25,9 @@ class NativePipelineRecipe {
   struct ShaderIdentity {
     uint64_t title_hash = 0;
     uint64_t code_hash = 0;
-    uint32_t variant = 0;  // stock early/late, override early/late
+    // Stock early/late, override early/late; +4 with early fragment tests,
+    // +8 without color outputs.
+    uint32_t variant = 0;
     uint32_t specialization_enabled = 0;
   };
   struct Snapshot {
@@ -102,7 +104,9 @@ class NativePipelineRecipe {
       return false;
     }
     for (uint32_t i = 0; i < data.stage_count; ++i) {
-      if (data.shaders[i].variant > 3 || data.shaders[i].specialization_enabled > VK_TRUE) {
+      // A limit of 3 here dropped every early-test and colorless recipe when
+      // the saved set was loaded, so those pipelines were never prebuilt.
+      if (data.shaders[i].variant > 11 || data.shaders[i].specialization_enabled > VK_TRUE) {
         return false;
       }
     }

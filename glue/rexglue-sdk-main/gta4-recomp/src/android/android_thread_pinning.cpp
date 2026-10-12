@@ -26,7 +26,10 @@
 
 #include <rex/cvar.h>
 
-REXCVAR_DEFINE_UINT32(gta4_thread_pinning, 0, "GTA IV/Performance",
+// Two by default, for the OPPO CPH2765 this fork targets: its two prime cores
+// (cpu5-6) were clocked to 2.2 GHz while the five others sat at 1.1-1.4 GHz,
+// and the thread that sets the frame time was mostly found on the slow ones.
+REXCVAR_DEFINE_UINT32(gta4_thread_pinning, 2, "GTA IV/Performance",
                       "Give the N busiest threads a big core each and keep the others off them "
                       "(0 = leave scheduling to Android)")
     .range(0, 4);

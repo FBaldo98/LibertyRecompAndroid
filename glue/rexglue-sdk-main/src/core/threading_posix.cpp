@@ -812,6 +812,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
 
+    // A finished thread may already be joined, and bionic aborts on a stale
+    // pthread_t (seen closing the game on Android 16). A thread takes
+    // state_mutex_ to finish, so holding it keeps the handle valid until the
+    // signal is queued.
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    if (state_ == State::kFinished) {
+      return;
+    }
+
     sigval value{};
     value.sival_ptr = this;
 #if REX_PLATFORM_ANDROID
