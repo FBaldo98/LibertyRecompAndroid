@@ -13,5 +13,5 @@ sdk.dir=$(cygpath -m "$ANDROID_HOME" 2>/dev/null || echo "$ANDROID_HOME")
 EOF
 
 cd "$APP_DIR"
-./gradlew --no-daemon "$TASK"
+./gradlew "$TASK"
 ls -la "$APP_DIR/app/build/outputs/apk/$VARIANT/"

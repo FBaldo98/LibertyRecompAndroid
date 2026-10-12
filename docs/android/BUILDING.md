@@ -16,7 +16,7 @@ The generated C++ for the game is checked in, as it is upstream, so building nee
 | Ninja | 1.11 |
 | Android Studio | for the SDK, the platform tools and its bundled JDK (`jbr`, JDK 17+) |
 | Android SDK platform | 35 |
-| **Android NDK** | **r29, `29.0.14206865`** (older NDKs lack `std::jthread` in libc++) |
+| **Android NDK** | **r30, `30.0.16248370`** (older NDKs lack `std::jthread` in libc++) |
 
 `os/android/scripts/env.sh` finds the SDK at `%LOCALAPPDATA%\Android\Sdk` and the JDK in
 `C:\Program Files\Android\Android Studio\jbr`. Override `ANDROID_HOME`, `ANDROID_NDK`, `NDK_VER` or

@@ -14,7 +14,7 @@ at 2.84 GHz, 3× A77, 4× A55), an Adreno 650, 8 GB of RAM and Android 13.
 
 ## 1. Building for Android
 
-- **Toolchain.** The project builds with **NDK r29** (29.0.14206865), arm64-v8a, API level 28+ for
+- **Toolchain.** The project builds with **NDK r30** (30.0.16248370), arm64-v8a, API level 28+ for
   the native code and minSdk 29 for the app. Older NDKs (r27c) ship a libc++ without `std::jthread`,
   which the runtime uses, so `clock_cast` is polyfilled as well.
 - **What gets built.** Android builds the same "Graine" ReXGlue consumer as macOS. It is packaged
