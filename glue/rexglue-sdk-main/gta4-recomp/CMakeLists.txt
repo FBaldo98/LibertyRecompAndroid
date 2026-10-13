@@ -437,6 +437,12 @@ elseif(ANDROID)
             -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date
             -Wno-backend-plugin)
         target_link_options(LibertyRecomp PRIVATE "-fprofile-use=${LIBERTY_ANDROID_PGO}")
+        # Objects compiled against an older profile do not link with newer
+        # ones ("ProfileSummary: IDs have conflicting values"). The profile's
+        # hash is in the compile flags, so a new profile recompiles them all.
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LIBERTY_ANDROID_PGO}")
+        file(SHA256 "${LIBERTY_ANDROID_PGO}" _liberty_pgo_profile_hash)
+        target_compile_definitions(LibertyRecomp PRIVATE LIBERTY_PGO_PROFILE_ID=${_liberty_pgo_profile_hash})
     endif()
 else()
     add_library(gta4_recomp INTERFACE)

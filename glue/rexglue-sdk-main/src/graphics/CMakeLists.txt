@@ -367,6 +367,10 @@ if(REXGLUE_USE_VULKAN)
             target_compile_options(rexgpu-gta4-native PRIVATE "-fprofile-use=${LIBERTY_ANDROID_PGO}"
                 -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
             target_link_options(rexgpu-gta4-native PRIVATE "-fprofile-use=${LIBERTY_ANDROID_PGO}")
+            # A new profile recompiles every object; see gta4-recomp/CMakeLists.txt.
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LIBERTY_ANDROID_PGO}")
+            file(SHA256 "${LIBERTY_ANDROID_PGO}" _liberty_pgo_profile_hash)
+            target_compile_definitions(rexgpu-gta4-native PRIVATE LIBERTY_PGO_PROFILE_ID=${_liberty_pgo_profile_hash})
         endif()
     endif()
     include("${LIBERTY_RECOMP_WORKSPACE_ROOT}/tools/vulkan/VulkanShaderArchive.cmake")
