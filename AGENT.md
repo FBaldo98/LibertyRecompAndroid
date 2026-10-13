@@ -240,7 +240,19 @@ merges the counters into the profile, then builds with it into
 `--no-install` only builds). One gotcha for future bat scripts: `shift` moves
 arguments into `%0`, so any `%~dp0` used after a parse loop stops being the
 script's directory (build_android.bat has this too; it only bites when called
-with arguments from another directory). To record one by hand (also after
+with arguments from another directory).
+
+**The recording build could hang on the loading screen** (2026-10-13, at
+random: the recording of the night before did not). The NDK r30 profile
+runtime is built without atomics, so two threads at one indirect-call site
+could be handed the same value-profile node; it was linked to itself and the
+threads spun in `__llvm_profile_instrument_target`, the libmain writer in
+`initializeValueProfRuntimeRecord` (its `.profraw` stopped updating). Both
+libraries now wrap `lprofPtrFetchAdd` and `lprofBoolCmpXchg` with atomic ones
+(`android_pgo_dump.cpp`, `-Wl,--wrap`). One load into gameplay was checked
+after the fix; the hang was a race, so that is not proof.
+
+To record one by hand (also after
 larger changes to the renderer or the game code):
 
 ```

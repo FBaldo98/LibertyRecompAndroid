@@ -360,7 +360,8 @@ if(REXGLUE_USE_VULKAN)
         target_sources(rexgpu-gta4-native PRIVATE gta4_native/android_pgo_dump.cpp)
         if(LIBERTY_ANDROID_PGO STREQUAL "generate")
             target_compile_options(rexgpu-gta4-native PRIVATE -fprofile-generate)
-            target_link_options(rexgpu-gta4-native PRIVATE -fprofile-generate)
+            target_link_options(rexgpu-gta4-native PRIVATE -fprofile-generate
+                "-Wl,--wrap=lprofBoolCmpXchg" "-Wl,--wrap=lprofPtrFetchAdd")
             target_compile_definitions(rexgpu-gta4-native PRIVATE LIBERTY_PGO_GENERATE=1)
         else()
             target_compile_options(rexgpu-gta4-native PRIVATE "-fprofile-use=${LIBERTY_ANDROID_PGO}"

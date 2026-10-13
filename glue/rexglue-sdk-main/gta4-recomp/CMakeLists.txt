@@ -427,7 +427,10 @@ elseif(ANDROID)
 
     if(LIBERTY_ANDROID_PGO STREQUAL "generate")
         target_compile_options(LibertyRecomp PRIVATE -fprofile-generate)
-        target_link_options(LibertyRecomp PRIVATE -fprofile-generate)
+        # The NDK profile runtime's non-atomic helpers hang the game; the
+        # atomic ones are in android_pgo_dump.cpp.
+        target_link_options(LibertyRecomp PRIVATE -fprofile-generate
+            "-Wl,--wrap=lprofBoolCmpXchg" "-Wl,--wrap=lprofPtrFetchAdd")
         target_compile_definitions(LibertyRecomp PRIVATE LIBERTY_PGO_GENERATE=1)
     elseif(LIBERTY_ANDROID_PGO)
         target_compile_options(LibertyRecomp PRIVATE "-fprofile-use=${LIBERTY_ANDROID_PGO}"

@@ -14,6 +14,20 @@
 extern "C" int __llvm_profile_write_file(void);
 extern "C" void __llvm_profile_set_filename(const char*);
 
+// Atomic replacements for the NDK profile runtime's non-atomic helpers; see
+// gta4-recomp/src/android/android_pgo_dump.cpp. This library links its own
+// copy of the runtime, so it needs its own pair (-Wl,--wrap in CMakeLists.txt).
+extern "C" {
+__attribute__((used, visibility("hidden"))) unsigned __wrap_lprofBoolCmpXchg(void** ptr, void* old_value,
+                                                                             void* new_value) {
+  return __atomic_compare_exchange_n(ptr, &old_value, new_value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+__attribute__((used, visibility("hidden"))) void* __wrap_lprofPtrFetchAdd(void** mem, long byte_increment) {
+  return reinterpret_cast<void*>(__atomic_fetch_add(reinterpret_cast<unsigned long*>(mem),
+                                                    static_cast<unsigned long>(byte_increment), __ATOMIC_SEQ_CST));
+}
+}
+
 namespace {
 
 struct PgoDumper {
