@@ -85,6 +85,20 @@ class FrameGenerationMap {
     return {&bucket->value, true};
   }
 
+  // Insert for callers that just probed with Find and know the key is absent
+  // (same generation, single-threaded). Skips Insert's redundant second hash
+  // and probe; growth still rehashes through InsertWithoutGrowth.
+  InsertResult InsertNew(const Key& key, const Value& value) {
+    if (!EnsureInsertionCapacity()) {
+      return {};
+    }
+    Bucket* bucket = InsertWithoutGrowth(key, value);
+    if (!bucket) {
+      return {};
+    }
+    return {&bucket->value, true};
+  }
+
   bool CanResetGeneration() const { return generation_ < kMaximumGeneration; }
 
   bool ResetGeneration() {
@@ -259,7 +273,7 @@ class FrameConstantArenaIndex {
       return std::nullopt;
     }
     const Reservation reservation{aligned_offset, byte_size};
-    const auto insertion = reservations_.Insert(identity, reservation);
+    const auto insertion = reservations_.InsertNew(identity, reservation);
     if (!insertion || !insertion.inserted) {
       return std::nullopt;
     }

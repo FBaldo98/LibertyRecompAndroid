@@ -487,6 +487,8 @@ REXCVAR_DEFINE_BOOL(gta4_native_batch_texture_uploads, true, "GTA IV/Graphics/Na
                     "Batch independent texture uploads before publishing the frame's draw bindings");
 REXCVAR_DEFINE_BOOL(gta4_validate_native_hot_caches, false, "GTA IV/Diagnostics",
                     "Cross-check incremental resource protection and constant uploads against original inputs");
+REXCVAR_DEFINE_BOOL(gta4_verify_native_fixed_state, false, "GTA IV/Diagnostics",
+                    "Re-hash every draw's fixed-function state at record time to catch worker/recorder divergence");
 REXCVAR_DEFINE_BOOL(gta4_profile_native_detailed_gpu, true, "GTA IV/Diagnostics",
                     "Enable approximate per-pass timestamps; coarse GPU envelope is cheaper on Metal");
 REXCVAR_DEFINE_BOOL(gta4_profile_native_moltenvk_detailed, false, "GTA IV/Diagnostics",
@@ -18992,6 +18994,8 @@ bool Gta4NativeGraphicsSystem::PrepareFrameTextures(VkCommandBuffer command_buff
     command.draw_descriptor_sets.fill(VK_NULL_HANDLE);
     command.binding_realization.fill(NativeBindingRealization::kUnused);
     command.room_light_input_bindings.reset();
+    // Pure per-command diagnostic gate; evaluate once instead of per stage.
+    const bool hove_candidate = IsHoveGantryGeometryCandidate(command);
     const bool capture_bulb_bindings = EmissionTraceConfig().pipeline_full_readback &&
         !bulb_full_frame_ && EmissionTraceActive(submitted_frame) && command.pipeline_state &&
         command.pipeline_state->pixel_shader_resource &&
@@ -19093,7 +19097,7 @@ bool Gta4NativeGraphicsSystem::PrepareFrameTextures(VkCommandBuffer command_buff
         if (sampler) {
           samplers[stage].sampler = sampler->sampler;
         }
-        if (IsHoveGantryGeometryCandidate(command)) {
+        if (hove_candidate) {
           static std::atomic<uint64_t> hove_sample_bind_count{0};
           const uint64_t hit = ++hove_sample_bind_count;
           if (hit <= 512) {
@@ -20487,6 +20491,12 @@ Gta4NativeGraphicsSystem::NativeSurfaceImage* Gta4NativeGraphicsSystem::GetOrCre
   return result;
 }
 
+void Gta4NativeGraphicsSystem::ClearRenderTargetResolutionMemo() {
+  for (auto& entry : render_target_memo_) {
+    entry.valid = false;
+  }
+}
+
 bool Gta4NativeGraphicsSystem::ResolveRenderingTarget(const NativeCommand& command,
                                                       VkImageView presenter_view,
                                                       uint32_t presenter_width,
@@ -20494,6 +20504,45 @@ bool Gta4NativeGraphicsSystem::ResolveRenderingTarget(const NativeCommand& comma
                                                       NativeRenderingTarget& target,
                                                       bool allow_allocation) {
   const profile::CpuScope profile_scope(profile::CpuOp::kTargetRealization);
+
+  // Direct-mapped memo probe (hot loop only). Resolution is a pure function
+  // of the pipeline-state snapshot, the usage inputs below, the presenter,
+  // and recorder-owned registry state; hundreds of consecutive draws repeat
+  // the same key inside a pass. Full key equality is authoritative, exactly
+  // as if the slow path had run.
+  NativeRenderTargetMemoEntry* memo_entry = nullptr;
+  bool memo_clear_command = false;
+  uint32_t memo_clear_flags = 0;
+  VkSampleCountFlagBits memo_sample_override = VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM;
+  if (allow_allocation) {
+    memo_clear_command = command.type == CommandType::kClear;
+    if (memo_clear_command) {
+      ClearCommand clear{};
+      std::memcpy(&clear, command.bytes.data(), sizeof(clear));
+      memo_clear_flags = clear.flags;
+    }
+    memo_sample_override = GetNativeSceneSampleOverride();
+    const uint64_t memo_seed =
+        (uint64_t(reinterpret_cast<uintptr_t>(command.pipeline_state.get())) >> 4) ^
+        (uint64_t(command.fixed_function_state.color_write_mask) * 0x9E3779B1u) ^
+        (uint64_t(memo_clear_flags) << 32) ^ (uint64_t(memo_clear_command) << 40) ^
+        (uint64_t(uint32_t(memo_sample_override)) << 48);
+    memo_entry = &render_target_memo_[memo_seed & (render_target_memo_.size() - 1)];
+    if (memo_entry->valid &&
+        memo_entry->pipeline_state == command.pipeline_state.get() &&
+        memo_entry->presenter_view == presenter_view &&
+        memo_entry->presenter_width == presenter_width &&
+        memo_entry->presenter_height == presenter_height &&
+        memo_entry->color_write_mask == command.fixed_function_state.color_write_mask &&
+        memo_entry->depth_enable == command.fixed_function_state.depth_enable &&
+        memo_entry->stencil_enable == command.fixed_function_state.stencil_enable &&
+        memo_entry->clear_flags == memo_clear_flags &&
+        memo_entry->scene_sample_override == memo_sample_override &&
+        memo_entry->clear_command == memo_clear_command) {
+      target = memo_entry->target;
+      return true;
+    }
+  }
 
   target = {};
   const NativePipelineState& state = *command.pipeline_state;
@@ -20746,7 +20795,24 @@ bool Gta4NativeGraphicsSystem::ResolveRenderingTarget(const NativeCommand& comma
     }
   }
   target.depth_stencil_attachment_active = requested_depth && target.depth_surface;
-  return (target.width && target.height) || reject("zero-target-dimensions");
+  if (target.width && target.height) {
+    if (memo_entry) {
+      memo_entry->pipeline_state = command.pipeline_state.get();
+      memo_entry->presenter_view = presenter_view;
+      memo_entry->presenter_width = presenter_width;
+      memo_entry->presenter_height = presenter_height;
+      memo_entry->color_write_mask = command.fixed_function_state.color_write_mask;
+      memo_entry->depth_enable = command.fixed_function_state.depth_enable;
+      memo_entry->stencil_enable = command.fixed_function_state.stencil_enable;
+      memo_entry->clear_flags = memo_clear_flags;
+      memo_entry->scene_sample_override = memo_sample_override;
+      memo_entry->clear_command = memo_clear_command;
+      memo_entry->target = target;
+      memo_entry->valid = true;
+    }
+    return true;
+  }
+  return reject("zero-target-dimensions");
 }
 
 NativeAttachmentUsage Gta4NativeGraphicsSystem::GetRenderingTargetUsage(
@@ -22477,6 +22543,14 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
   shared_key.environment_present = command.environmental_data ? 1 : 0;
   shared_key.split_postfx_applied = command.temporal_composite_mode ? command.temporal_composite_mode : command.split_postfx_applied;
 
+  // Consecutive draws in a pass almost always repeat the previous draw's
+  // semantic key. A memcmp against the memo replaces the identity-map probe
+  // (a ~1 KB word pack + XXH3 + bucket walk per draw); the key's operator==
+  // is the same authoritative test the map applies after a hash match. The
+  // cached allocation's arena reservation is stable for the whole frame.
+  if (shared_constant_memo_valid_ && shared_constant_memo_key_ == shared_key) {
+    shared_constants_allocation = shared_constant_memo_allocation_;
+  } else {
   if (active_frame_slot_ >= frame_constant_arenas_.size()) {
     return false;
   }
@@ -22488,7 +22562,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
       return false;
     }
     const uint64_t next_identity = constant_arena.next_shared_identity++;
-    const auto insertion = constant_arena.shared_versions.Insert(shared_key, next_identity);
+    const auto insertion = constant_arena.shared_versions.InsertNew(shared_key, next_identity);
     if (!insertion || !insertion.inserted) {
       return false;
     }
@@ -22561,6 +22635,10 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
                                         shared_bytes, false, shared_constants_allocation)) {
       return false;
     }
+  }
+  shared_constant_memo_key_ = shared_key;
+  shared_constant_memo_allocation_ = shared_constants_allocation;
+  shared_constant_memo_valid_ = true;
   }
 
   static const bool trace_glass_output = [] {
@@ -23277,29 +23355,47 @@ bool Gta4NativeGraphicsSystem::RecordPrimitiveUp(VkCommandBuffer command_buffer,
 bool Gta4NativeGraphicsSystem::GetRequiredVertexStreams(
     const NativePipelineState& state,
     std::array<bool, kVertexStreamCount>& required_streams) const {
-  required_streams.fill(false);
-  if (!state.vertex_shader_resource || !state.vertex_declaration_resource) {
-    return false;
+  // Pure over two immutable snapshot objects; memoize on the state instead of
+  // re-running the inputs x elements location match for every draw.
+  if (state.required_streams_memo != NativePipelineState::kRequiredStreamsMemoUncomputed) {
+    const bool valid = (state.required_streams_memo & (1u << 31)) != 0;
+    for (uint32_t stream = 0; stream < kVertexStreamCount; ++stream) {
+      required_streams[stream] = valid && ((state.required_streams_memo >> stream) & 1u);
+    }
+    return valid;
   }
-
-  for (const NativeVertexInput& shader_input : state.vertex_shader_resource->vertex_inputs) {
-    const VertexElement* matching_element = nullptr;
-    for (const VertexElement& element : state.vertex_declaration_resource->elements) {
-      if (ConvertVertexUsageToLocation(element.usage, element.usage_index) ==
-          shader_input.location) {
-        matching_element = &element;
+  required_streams.fill(false);
+  bool valid = false;
+  if (state.vertex_shader_resource && state.vertex_declaration_resource) {
+    valid = true;
+    for (const NativeVertexInput& shader_input : state.vertex_shader_resource->vertex_inputs) {
+      const VertexElement* matching_element = nullptr;
+      for (const VertexElement& element : state.vertex_declaration_resource->elements) {
+        if (ConvertVertexUsageToLocation(element.usage, element.usage_index) ==
+            shader_input.location) {
+          matching_element = &element;
+          break;
+        }
+      }
+      if (!matching_element) {
+        continue;
+      }
+      if (matching_element->stream >= kVertexStreamCount) {
+        valid = false;
+        required_streams.fill(false);
         break;
       }
+      required_streams[matching_element->stream] = true;
     }
-    if (!matching_element) {
-      continue;
-    }
-    if (matching_element->stream >= kVertexStreamCount) {
-      return false;
-    }
-    required_streams[matching_element->stream] = true;
   }
-  return true;
+  uint32_t memo = valid ? (1u << 31) : 0u;
+  if (valid) {
+    for (uint32_t stream = 0; stream < kVertexStreamCount; ++stream) {
+      memo |= uint32_t(required_streams[stream]) << stream;
+    }
+  }
+  state.required_streams_memo = memo;
+  return valid;
 }
 
 bool Gta4NativeGraphicsSystem::RecordPrimitive(VkCommandBuffer command_buffer,
@@ -23665,19 +23761,30 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
     if (order_independent) {
       auto& ranges = command.index_buffer->vertex_cache_ranges;
       const uint64_t range_key = uint64_t(draw.start_index) << 32 | draw.index_count;
-      auto found = ranges.find(range_key);
-      if (found == ranges.end()) {
-        auto range = std::make_shared<NativeVertexCacheRange>();
-        if (NativeVertexCacheOptimizer::Get().Enqueue(range, selected_index_bytes,
-                                                      host_index_count, index32)) {
-          found = ranges.emplace(range_key, std::move(range)).first;
+      const std::shared_ptr<NativeVertexCacheRange>* range_slot =
+          command.index_buffer->vertex_cache_last_key == range_key
+              ? command.index_buffer->vertex_cache_last_range
+              : nullptr;
+      if (!range_slot) {
+        auto found = ranges.find(range_key);
+        if (found == ranges.end()) {
+          auto range = std::make_shared<NativeVertexCacheRange>();
+          if (NativeVertexCacheOptimizer::Get().Enqueue(range, selected_index_bytes,
+                                                        host_index_count, index32)) {
+            found = ranges.emplace(range_key, std::move(range)).first;
+          }
+        }
+        range_slot = found != ranges.end() ? &found->second : nullptr;
+        if (range_slot) {
+          command.index_buffer->vertex_cache_last_key = range_key;
+          command.index_buffer->vertex_cache_last_range = range_slot;
         }
       }
       const std::vector<uint8_t>* reordered =
-          found != ranges.end() &&
-                  found->second->state.load(std::memory_order_acquire) ==
+          range_slot && *range_slot &&
+                  (*range_slot)->state.load(std::memory_order_acquire) ==
                       NativeVertexCacheRange::kReady
-              ? &found->second->indices
+              ? &(*range_slot)->indices
               : nullptr;
       if (reordered) {
         NativePersistentBufferKey key{};
@@ -28658,6 +28765,8 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
   tv_frame_trace_.reset();
   phone_record_event_ = 0;
   native_draw_state_cache_.Reset(); ubo_bound_layout_ = VK_NULL_HANDLE;
+  ClearRenderTargetResolutionMemo();
+  shared_constant_memo_valid_ = false;
   presenter_transfer_written = false;
   presenter_written = false;
   (void)environmental_data;
@@ -28668,6 +28777,10 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
       rex::diagnostics::IsEnabled(rex::diagnostics::Category::kTransition) &&
       transition::IsEnabled() && transition::ActiveTransitionId();
   const bool collect_frame_diagnostics = legacy_diagnostics || transition_trace;
+  // Light-probe modes are frame-constant diagnostic settings; read them once
+  // instead of copying the cvar strings for every command in the loop below.
+  const std::string ps9_stencil_probe = REXCVAR_GET(gta4_native_light_ps9_stencil_probe);
+  const std::string stencil_face_probe = REXCVAR_GET(gta4_native_light_stencil_face_probe);
   uint64_t invocation = 0;
   if (collect_frame_diagnostics) {
     static std::atomic<uint64_t> invocation_counter{0};
@@ -30406,9 +30519,16 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
       ReleaseResourceCommand release{};
       std::memcpy(&release, queued_command.bytes.data(), sizeof(release));
       QueueSurfaceImageRelease(release.resource);
+      // Released surfaces are skipped by later resolutions; a memoized target
+      // could still reference one.
+      ClearRenderTargetResolutionMemo();
       continue;
     }
-    if ((queued_command.type == CommandType::kDrawPrimitive ||
+    // The worker already stamps the state hash at assembly time; re-hashing
+    // here costs a ~260 B serialize + XXH3 per draw in every build, so the
+    // divergence check stays behind a diagnostics cvar.
+    if (REXCVAR_GET(gta4_verify_native_fixed_state) &&
+        (queued_command.type == CommandType::kDrawPrimitive ||
          queued_command.type == CommandType::kDrawPrimitiveUp ||
          queued_command.type == CommandType::kDrawIndexedPrimitive ||
          queued_command.type == CommandType::kClear) &&
@@ -30428,7 +30548,6 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
     const NativeCommand* command_pointer = &queued_command;
     constexpr uint64_t kDeferredLightingPs9Hash = 0x23C88DA6F953E36Bull;
     constexpr uint32_t kFillerVolumePointTechnique = 11;
-    const std::string ps9_stencil_probe = REXCVAR_GET(gta4_native_light_ps9_stencil_probe);
     const bool ps9_accumulation_draw =
         queued_command.light_trace_technique == kFillerVolumePointTechnique &&
         queued_command.light_trace_mode == 0 && queued_command.pipeline_state &&
@@ -30478,7 +30597,6 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
       }
     }
 
-    const std::string stencil_face_probe = REXCVAR_GET(gta4_native_light_stencil_face_probe);
     constexpr uint64_t kDeferredLightingVs1Hash = 0xA97B1F043F720396ull;
     uint64_t stencil_face_probe_instance = 0;
     if (stencil_face_probe != "original" && queued_command.pipeline_state &&

@@ -303,6 +303,11 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     // attribution (string searches over both filenames); 0xFFFF: not computed.
     mutable uint16_t translucent_range_memo = 0xFFFF;
     mutable uint16_t shader_category_memo = 0xFFFF;
+    // Memo of GetRequiredVertexStreams over this immutable snapshot: bit 31 =
+    // computed-and-valid, bits 0-16 = required streams. Writes are idempotent
+    // (every writer derives the same value from the immutable inputs).
+    static constexpr uint32_t kRequiredStreamsMemoUncomputed = ~0u;
+    mutable uint32_t required_streams_memo = kRequiredStreamsMemoUncomputed;
   };
 
   struct NativePersistentBufferEntry;
@@ -340,6 +345,11 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     // (NativeVertexCacheOptimizer), keyed by start << 32 | count.
     mutable std::unordered_map<uint64_t, std::shared_ptr<NativeVertexCacheRange>>
         vertex_cache_ranges;
+    // 1-entry memo of the last vertex_cache_ranges lookup: the map only grows
+    // for this resource's lifetime, so a found slot pointer stays valid and
+    // repeated same-range draws skip the hash probe.
+    mutable uint64_t vertex_cache_last_key = ~0ull;
+    mutable const std::shared_ptr<NativeVertexCacheRange>* vertex_cache_last_range = nullptr;
     mutable NativeOwnerRetirementWatch<NativePersistentBufferEntry> persistent_retirement;
     // Recorder-only: the persistent buffer entry this resource resolved to
     // last (GetOrCreatePersistentBuffer), with its key's bytes and the map's
@@ -2467,6 +2477,38 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   bool native_descriptor_layouts_update_after_bind_ = false;
   uint32_t native_descriptor_maximum_page_count_ = 0;
   NativeDrawStateCache<2> native_draw_state_cache_;
+  // Per-frame memo for ResolveRenderingTarget. Passes bind the same
+  // (pipeline state, usage) pair for hundreds of consecutive draws, so the
+  // resolved attachments are copied from a direct-mapped cache instead of
+  // re-walking the surface registry (spin lock + map probes per attachment
+  // per draw). Cleared at the start of each RecordNativeFrame and on every
+  // in-stream kReleaseResource, the only recorder-side mutation that can
+  // retire a resolved surface mid-frame.
+  struct NativeRenderTargetMemoEntry {
+    const NativePipelineState* pipeline_state = nullptr;
+    VkImageView presenter_view = VK_NULL_HANDLE;
+    uint32_t presenter_width = 0;
+    uint32_t presenter_height = 0;
+    uint32_t color_write_mask = 0;
+    uint32_t depth_enable = 0;
+    uint32_t stencil_enable = 0;
+    uint32_t clear_flags = 0;
+    VkSampleCountFlagBits scene_sample_override = VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM;
+    bool clear_command = false;
+    bool valid = false;
+    NativeRenderingTarget target{};
+  };
+  std::array<NativeRenderTargetMemoEntry, 8> render_target_memo_{};
+  void ClearRenderTargetResolutionMemo();
+  // Consecutive-draw memo for the BindCommonDrawState shared-constant block.
+  // A pass binds the same semantic key for hundreds of draws in a row, so the
+  // identity-map probe (a ~1 KB word pack + XXH3 per draw) is skipped while
+  // the key matches the previous draw's. The arena reservation backing the
+  // cached allocation is stable for the whole frame; the memo is dropped at
+  // the start of each RecordNativeFrame.
+  NativeSharedConstantSemanticKey shared_constant_memo_key_{};
+  NativeUploadAllocation shared_constant_memo_allocation_{};
+  bool shared_constant_memo_valid_ = false;
   NativeDescriptorSlotHandle native_null_image_descriptor_{};
   NativeDescriptorSlotHandle native_null_sampler_descriptor_{};
   uint32_t active_descriptor_copy_ = 0;

@@ -79,10 +79,13 @@ class NativeImmutableBindings {
     }
     // Own before publishing any pointer-bearing entry. A content-hash match is
     // never used without equality of the written guest-endian bytes.
+    // Both maps were probed above (versions_ at entry, contents_ for the
+    // candidate), so the keys are known absent: InsertNew skips the redundant
+    // second hash+probe of a plain Insert.
     owners_.push_back(version);
     const Entry entry{allocation, bytes};
-    if (!candidate && !contents_.Insert(key, entry)) return Result::kFailure;
-    if (!versions_.Insert(identity, entry)) return Result::kFailure;
+    if (!candidate && !contents_.InsertNew(key, entry)) return Result::kFailure;
+    if (!versions_.InsertNew(identity, entry)) return Result::kFailure;
     return result;
   }
   bool CanReset() const { return versions_.CanResetGeneration() && contents_.CanResetGeneration(); }

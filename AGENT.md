@@ -137,6 +137,43 @@ sees**; the cure is production above the limit, not presentation.
    are built `-O3` with thin LTO; index reordering for the vertex cache is
    done once per mesh in the background; guest spinlock retries are about
    1,900 per second; gameplay logging is a few lines per second.
+6. **Recorder per-draw CPU pass (2026-10-13, unmeasured on device).** Five
+   changes to the recorder hot path, all image-identical and built but not yet
+   profiled on the phone. Re-measure with `profile.sh incl GtaRecorder` and
+   re-record the PGO profile (see "Building"): the recorder's hot blocks moved.
+   - `ResolveRenderingTarget` is memoized per frame: 8 direct-mapped entries
+     keyed by pipeline-state pointer, usage inputs, presenter and the scene
+     sample override. The registry walk (spin lock + map probes per
+     attachment) ran for every draw; the same attachments repeat for hundreds
+     of draws. Invalidated at frame start and on every in-stream
+     `kReleaseResource` (the only recorder-side surface retirement).
+   - The `BindCommonDrawState` shared-constant block is memoized on the
+     previous draw's semantic key (516 B memcmp replaces a ~1 KB pack + XXH3
+     + two map probes per draw). The cached allocation's arena reservation is
+     stable within a frame; the memo resets per `RecordNativeFrame`.
+   - `FrameGenerationMap::InsertNew` skips the redundant second hash+probe of
+     `Insert` when the caller just probed (constant versions, shared keys,
+     arena reservations). Every constant version is re-inserted every frame,
+     so the shared key was hashed three times per frame before.
+   - The per-draw fixed-state integrity re-hash (a 260 B serialize + XXH3 per
+     draw in release) is now behind `gta4_verify_native_fixed_state` (default
+     off). It only logged worker/recorder divergence; the worker-side stamp
+     is unchanged.
+   - Smaller: `GetRequiredVertexStreams` memoized on the immutable
+     `NativePipelineState`; the Hove gantry gate hoisted out of the texture
+     stage loop; the two light-probe cvar strings are read once per frame
+     instead of per command; the vertex-cache range map probe has a 1-entry
+     memo.
+   - Considered and rejected: moving the indexed-merge scan and the
+     invisible-draw test to the worker (both are already ordered
+     cheap-to-expensive recorder-side; <1% at logic-divergence risk);
+     packing `NativePipelineKeyHash` (miss-path only); removing the TEMP
+     telemetry atomics (the measurement scripts use them).
+   - Still open from "Open": the shadow-map pass on a second recording thread
+     (feasible; ~25-35% recorder reduction; per-slot pools/CBs, one
+     partitioned constant arena, a sharded lock around
+     `GetOrCreatePersistentBuffer`, serial fallback), and
+     `PrepareFrameTextures` off the recorder (mostly subsumed by the former).
 
 ## Open
 
