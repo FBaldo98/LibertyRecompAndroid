@@ -231,8 +231,17 @@ Gradle 8.11). `--no-install` only builds.
 **Profile-guided optimization.** The profile is `out/pgo/liberty.profdata`. It
 is not in the repository (`out/` is ignored): a fresh clone builds without it
 and the recorder is about 20-25% slower. `build_android.bat` uses the profile
-when the file exists, in the build folder `out/build/android-arm64-pgo`. To
-record one (also after larger changes to the renderer or the game code):
+when the file exists, in the build folder `out/build/android-arm64-pgo`. The
+flow is wrapped by `build_android_pgo_record.bat` (builds the recording build
+into `out/build/android-arm64-pgogen`, installs it without launching and
+clears the device counters) and `build_android_pgo_optimized.bat` (pulls and
+merges the counters into the profile, then builds with it into
+`out/build/android-arm64-pgo`; `--no-pull` reuses the existing profile,
+`--no-install` only builds). One gotcha for future bat scripts: `shift` moves
+arguments into `%0`, so any `%~dp0` used after a parse loop stops being the
+script's directory (build_android.bat has this too; it only bites when called
+with arguments from another directory). To record one by hand (also after
+larger changes to the renderer or the game code):
 
 ```
 BUILD_DIR=$PWD/out/build/android-arm64-pgogen PGO=generate STRIP=1 bash os/android/scripts/build_native.sh
