@@ -16,15 +16,38 @@
 
 #include "gta4_init.h"
 
-// Off by default: it gained nothing measurable, and the game-code crash in
-// sub_8296E480 (stale object pointer) first appeared in builds that had it;
-// changing the main thread's timing can expose game-side races.
+// The spin is a quarter of a core (27% of the title thread's samples), but on
+// an OPPO CPH2765 it is also what keeps the clocks up: the phone sets the
+// clock limit of a cluster from its load, and without a thread near full load
+// it held cpu0-4 at 1.2-1.4 GHz instead of 2.5 GHz. Measured on 2026-10-13 in
+// one scene, alternating the setting live:
+//   thermal status 2: spinning 29.9 and 30.0 FPS, sleeping 27.4 and 21.8 FPS
+//   thermal status 4: spinning 24.0 and 24.4 FPS, sleeping 23.9 and 24.7 FPS
+// In that second measurement every core was at its clock floor (cpu0-4 at
+// 0.998 GHz, cpu5-6 at 0.77 GHz) whatever the load, so the spin bought nothing
+// and only added heat. Status 4 alone is not that state: at status 4 and
+// 36 degrees C, sleeping let cpu0-4 fall to 1.2 GHz and the game to 24.5 FPS.
+// The hook therefore sleeps at the clock floor, not at a thermal status.
+//
+// Always sleeping is therefore off by default. It was off before for the
+// game-code crash in sub_8296E480 (stale object pointer), which first appeared
+// in builds that had it: changing the main thread's timing can expose
+// game-side races. gta4_stale_object_guard covers that crash now.
 REXCVAR_DEFINE_BOOL(gta4_frame_wait_sleep, false, "GTA IV/Performance",
-                    "Sleep instead of spinning while the title waits for a frame slot");
+                    "Always sleep instead of spinning while the title waits for a frame slot "
+                    "(cooler, but a phone that clocks by load then drops below the frame limit)");
+REXCVAR_DEFINE_BOOL(gta4_frame_wait_sleep_throttled, true, "GTA IV/Performance",
+                    "Sleep instead of spinning while every core is held at its clock floor");
+// For finding the least load that still holds the clocks: untested.
+REXCVAR_DEFINE_UINT32(gta4_frame_wait_spin_percent, 100, "GTA IV/Performance",
+                      "Share of the wait for a frame slot that is spent spinning; the rest sleeps")
+    .range(0, 100);
 REXCVAR_DEFINE_UINT32(gta4_extra_frames_in_flight, 0, "GTA IV/Performance",
                       "Frames the title may run ahead beyond its own limit of two pending "
                       "frames (more throughput, one frame of input latency each)")
     .range(0, 2);
+
+extern "C" bool liberty_android_clock_floor();
 
 extern "C" void sub_82A46D70(PPCContext& ctx, uint8_t* base) {
   const uint32_t out = ctx.r4.u32;
@@ -36,8 +59,21 @@ extern "C" void sub_82A46D70(PPCContext& ctx, uint8_t* base) {
     pending = pending > extra ? pending - extra : 0;
     REX_STORE_U32(out + 8, pending);
   }
-  if (pending >= 2 && REXCVAR_GET(gta4_frame_wait_sleep)) {
-    const timespec delay{0, 250 * 1000};
+  if (pending < 2) return;
+  long sleep_nanos = 0;
+  if (REXCVAR_GET(gta4_frame_wait_sleep) ||
+      (REXCVAR_GET(gta4_frame_wait_sleep_throttled) && liberty_android_clock_floor())) {
+    sleep_nanos = 250 * 1000;
+  } else if (const uint32_t spin = REXCVAR_GET(gta4_frame_wait_spin_percent); spin < 100) {
+    // Each millisecond starts with the sleeping share and ends with the spin.
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const long phase = now.tv_nsec % 1'000'000;
+    const long sleeping = long(100 - spin) * 10'000;
+    if (phase < sleeping) sleep_nanos = sleeping - phase;
+  }
+  if (sleep_nanos) {
+    const timespec delay{0, sleep_nanos};
     nanosleep(&delay, nullptr);
   }
 }

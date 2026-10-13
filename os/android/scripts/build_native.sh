@@ -5,9 +5,18 @@
 #   assets/Resources   fonts, button prompts and the RPF key
 #
 # usage: build_native.sh [jobs]      (default: number of CPUs - 2)
+# PGO=generate builds the recording libraries and PGO=<file.profdata> the
+# optimized ones (see pgo.sh). It is read when a build folder is configured,
+# so give each its own BUILD_DIR.
 set -euo pipefail
 . "$(dirname "$0")/env.sh"
 JOBS="${1:-$(( $(nproc) > 3 ? $(nproc) - 2 : 1 ))}"
+PGO_ARGUMENT=()
+if [ "${PGO:-}" = "generate" ]; then
+  PGO_ARGUMENT=(-DLIBERTY_ANDROID_PGO=generate)
+elif [ -n "${PGO:-}" ]; then
+  PGO_ARGUMENT=(-DLIBERTY_ANDROID_PGO="$(cygpath -m "$PGO")")
+fi
 
 [ -d "$ANDROID_NDK" ] || { echo "no NDK at $ANDROID_NDK"; exit 1; }
 
@@ -33,6 +42,7 @@ if [ ! -f "$BUILD_DIR/build.ninja" ] || ! grep -q -- "-fno-emulated-tls" "$BUILD
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DREXGLUE_ENABLE_TRACY=OFF \
+    "${PGO_ARGUMENT[@]}" \
     -DGTA4_NATIVE_SPIRV_VAL="$(cygpath -m "$ANDROID_NDK/shader-tools/windows-x86_64/spirv-val.exe")" \
     -DGTA4_NATIVE_GLSLANG_VALIDATOR="$(cygpath -m "$REPO/out/host-tools/glslang/bin/glslangValidator.exe")" \
     -DGTA4_NATIVE_DXC_LIBRARY_PATH="$(cygpath -m "$REPO/out/host-tools/dxc/bin/x64")"

@@ -28,9 +28,10 @@ at 2.84 GHz, 3× A77, 4× A55), an Adreno 650, 8 GB of RAM and Android 13.
 - **Linking.** `libmain` uses ThinLTO and `-Bsymbolic-functions`, so calls between recompiled
   functions do not go through the PLT. The ReXGlue CLI emits a 64-byte aligned TLS segment, which
   Bionic requires for arm64 executables and libraries.
-- **PGO.** Profile-guided optimization is wired up for the renderer library
-  (`-DLIBERTY_ANDROID_PGO=generate` writes profiles on the device every 60 s;
-  `=<path to .profdata>` uses them).
+- **PGO.** Profile-guided optimization is wired up for the game code and the renderer library
+  (`PGO=generate` for `build_native.sh` writes profiles on the device every 60 s;
+  `PGO=<path to .profdata>` uses them; `pgo.sh` pulls and merges them). It made the renderer's
+  recording thread about 20-25% faster on the OPPO CPH2765.
 - **Direct calls.** An experiment, `tools/direct_calls.py`, rewrites calls between unhooked
   recompiled functions to bypass their weak aliases so the compiler can inline them. It is off by
   default: it gave no measurable gain and made the APK bigger.
@@ -236,8 +237,10 @@ because benchmarking was done at night, when shadows are not visible.
 - **The 30 FPS guard** (`gta4_fps_guard`, off by default) can halve the environment reflection
   rate while frames miss 30 FPS. An earlier version also cut shadows and could get stuck, which
   turned the player's shadow into a dot.
-- **The frame-wait hook** (`gta4_frame_wait_sleep`, off by default) replaces the game's busy-wait
-  on completed frames with a short sleep.
+- **The frame-wait hook** replaces the game's busy-wait on completed frames with a short sleep
+  while every core is held at its clock floor (`gta4_frame_wait_sleep_throttled`, on by
+  default). `gta4_frame_wait_sleep` (off by default) sleeps always: cooler, but the OPPO CPH2765
+  sets its clock limits from the load and then drops from 30 to 22-27 FPS.
 
 ## 6. Version history
 

@@ -70,9 +70,19 @@ if /i "%JAVA_HOME%"=="%liberty_jdk%" if not exist "%liberty_jdk%\bin\java.exe" (
     del "%liberty_jdk%.zip"
 )
 
+rem A recorded profile (os\android\scripts\pgo.sh) makes this the
+rem profile-optimized build, in its own build folder.
+set "liberty_root=%~dp0"
+set "liberty_root=%liberty_root:\=/%"
+if not defined PGO if exist "%~dp0out\pgo\liberty.profdata" (
+    set "PGO=%liberty_root%out/pgo/liberty.profdata"
+    if not defined BUILD_DIR set "BUILD_DIR=%liberty_root%out/build/android-arm64-pgo"
+)
+
 echo == bash:   %liberty_bash%
 echo == python: %liberty_python%
 if defined JAVA_HOME echo == java:   %JAVA_HOME%
+if defined PGO echo == pgo:    %PGO%
 
 if defined do_setup (
     python tools\setup_repo.py || exit /b 1
