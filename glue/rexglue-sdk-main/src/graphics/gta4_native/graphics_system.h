@@ -2131,6 +2131,92 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkCommandPool secondary_command_pool_ = VK_NULL_HANDLE;
   VkCommandBuffer secondary_command_buffer_ = VK_NULL_HANDLE;
+
+  // Parallel recording of long depth-only passes (the shadow map is 1,500 to
+  // 2,300 of a frame's draws), gta4_native_parallel_shadow_recording. The
+  // recorder keeps walking the frame; for such a pass it hands the begin, each
+  // indexed draw and the end to a second thread, which records them into a
+  // command buffer of its own, and continues in a new command buffer itself.
+  // The frame is submitted as M0, P0, M1, P1, ... in recording order. State
+  // both threads touch is guarded by parallel_pass_mutex_ while
+  // parallel_pass_active_ is set; state bound to a command buffer exists once
+  // per thread.
+  static constexpr uint32_t kParallelPassSegments = 8;
+  static constexpr uint32_t kParallelPassQueueSize = 8192;  // Power of two.
+  struct ParallelPassSegment {
+    VkRenderingInfo info{};
+    std::array<VkRenderingAttachmentInfo, 7> colors{};
+    VkRenderingAttachmentInfo depth{};
+    VkRenderingAttachmentInfo stencil{};
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  };
+  struct ParallelPassJob {
+    enum class Kind : uint8_t { kBegin, kDraw, kEnd };
+    Kind kind = Kind::kDraw;
+    uint32_t segment = 0;
+    const NativeCommand* command = nullptr;
+    const NativeRenderingTarget* target = nullptr;
+    // Draws recorded as one (see gta4_native_merge_indexed_draws).
+    uint32_t merged_count = 1;
+    uint32_t merged_indices = 0;
+  };
+  struct ParallelPassSlot {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    std::array<VkCommandBuffer, kParallelPassSegments> pass_command_buffers{};
+    // From the slot's command_pool_: the recorder's command buffers after M0.
+    std::array<VkCommandBuffer, kParallelPassSegments> main_command_buffers{};
+    bool main_allocated = false;
+  };
+  std::unique_lock<std::recursive_mutex> LockParallelPass() const {
+    return parallel_pass_active_.load(std::memory_order_relaxed)
+               ? std::unique_lock<std::recursive_mutex>(parallel_pass_mutex_)
+               : std::unique_lock<std::recursive_mutex>();
+  }
+  NativeDrawStateCache<2>& RecorderDrawState();
+  bool EnsureParallelPassSlot();
+  // Hands the rendering scope to the second thread and moves the recorder to
+  // its next command buffer. False: the scope has to be recorded as usual.
+  bool BeginParallelPassSegment(const VkRenderingInfo& info, VkCommandBuffer& command_buffer);
+  void QueueParallelPassDraw(const NativeCommand& command, const NativeRenderingTarget& target,
+                             uint32_t merged_count, uint32_t merged_indices, bool wait);
+  void EndParallelPassSegment();
+  // Closes an open segment and waits for the second thread. Idempotent.
+  void FinishParallelPass();
+  void PushParallelPassJob(const ParallelPassJob& job);
+  void WaitForParallelPass();
+  void ParallelPassThreadMain();
+  void StopParallelPassThread();
+  void DestroyParallelPassObjects();
+  std::array<ParallelPassSlot, 2> parallel_pass_slots_{};
+  std::array<ParallelPassSegment, kParallelPassSegments> parallel_pass_segments_{};
+  std::vector<std::unique_ptr<NativeRenderingTarget>> parallel_pass_targets_;
+  uint32_t parallel_pass_segment_count_ = 0;
+  bool parallel_pass_segment_open_ = false;
+  // The recorder's last command buffer of the frame; null while it is M0.
+  VkCommandBuffer parallel_pass_tail_ = VK_NULL_HANDLE;
+  mutable std::recursive_mutex parallel_pass_mutex_;
+  std::atomic<bool> parallel_pass_active_{false};
+  std::atomic<bool> parallel_pass_failed_{false};
+  std::thread parallel_pass_thread_;
+  std::vector<ParallelPassJob> parallel_pass_queue_;
+  std::atomic<uint32_t> parallel_pass_queue_head_{0};
+  std::atomic<uint32_t> parallel_pass_queue_tail_{0};
+  std::atomic<uint64_t> parallel_pass_jobs_done_{0};
+  uint64_t parallel_pass_jobs_pushed_ = 0;
+  std::mutex parallel_pass_wake_mutex_;
+  std::condition_variable parallel_pass_wake_;
+  std::atomic<bool> parallel_pass_parked_{false};
+  std::atomic<bool> parallel_pass_stop_{false};
+  // The second thread's copies of the state bound to its command buffer.
+  NativeDrawStateCache<2> parallel_pass_draw_state_;
+  NativeSharedConstantSemanticKey parallel_pass_shared_memo_key_{};
+  NativeUploadAllocation parallel_pass_shared_memo_allocation_{};
+  bool parallel_pass_shared_memo_valid_ = false;
+  VkPipelineLayout parallel_pass_ubo_layout_ = VK_NULL_HANDLE;
+  VkDescriptorSet parallel_pass_ubo_set_ = VK_NULL_HANDLE;
+  VkCommandBuffer parallel_pass_ubo_command_buffer_ = VK_NULL_HANDLE;
+  std::array<uint32_t, 2> parallel_pass_ubo_offsets_{};
+  uint32_t parallel_pass_merge_override_ = 0;
   VkRenderPass clear_render_pass_ = VK_NULL_HANDLE;
   VkFramebuffer clear_framebuffer_ = VK_NULL_HANDLE;
   uint64_t clear_framebuffer_image_version_ = 0;

@@ -93,8 +93,19 @@ three `XThread`s at about 20% each.
   with the highest current clock limit; the other threads share the rest. The
   two must share a cluster so that the spin raises the recorder's clock. At
   the clock floor nothing is pinned: the same scene ran at 21.5, 23.9 and
-  21.8 FPS with pinning 2, 0 and 2. **The current rule (recorder first, floor
-  by clock limit) is built and installed but not measured.** Before it, the
+  21.8 FPS with pinning 2, 0 and 2. Checked again on 2026-10-13 with the
+  current rule and the optimized build, at the floor in a steady scene of
+  about 3,800 commands: 20.4, 18.9 and 20.2 FPS with pinning off, on and off
+  (26 seconds each, through a temporary switch that was not kept). Unpinned,
+  the recorder was on the prime pair (0.77 GHz) in 20 of 40 samples, and it
+  is still the faster arrangement: do not pin at the floor. Above the floor
+  the rule does what it says: with cpu0-4 at 2.36 GHz and prime at 1.02 GHz
+  the recorder was confined to and running on cpu0 and the title thread on
+  cpu1 in every sample (29.3-29.8 FPS). The other threads may then use
+  cpu2-6 and were on the 1.0 GHz prime cores in about a third of the
+  samples; **whether keeping them on cpu2-4 helps is not tested**. Affinity
+  cannot be set from adb (`run-as ... taskset` is denied), so such a test
+  needs a cvar in the build. Before the current rule, the
   ranking was by CPU time alone and the cores were ranked by hardware maximum,
   which put the two busiest threads on the prime pair even when that was the
   slowest cluster (0.77 GHz against 1.11 GHz).
@@ -175,12 +186,53 @@ sees**; the cure is production above the limit, not presentation.
      `GetOrCreatePersistentBuffer`, serial fallback), and
      `PrepareFrameTextures` off the recorder (mostly subsumed by the former).
 
+7. **Parallel recording of the shadow pass (2026-10-13): written, compiles,
+   never run.** `gta4_native_parallel_shadow_recording`, default off. Nobody
+   has seen a frame from it: turn it on with `live_cvar.sh`, look at the
+   shadows first, then measure.
+   - What it does: before the command loop, `RecordNativeFrame` finds runs of
+     at least `gta4_native_parallel_shadow_min_draws` (256) consecutive
+     indexed draws with no color target and one depth surface. For such a run
+     the recorder still walks every command (target resolution, culling,
+     merging, content claims are unchanged), but the rendering scope's begin,
+     each `RecordIndexedPrimitive` and the end go through a queue to a second
+     thread (`GtaPassRecorder`), which records them into a command buffer of
+     its own. The recorder continues in a new command buffer; the frame is
+     submitted as M0, P0, M1, P1, ... (up to 8 passes per frame, then the
+     rest records as before).
+   - Shared state is guarded by one recursive mutex, taken only while a pass
+     is in flight (`LockParallelPass`): pipeline lookup, buffer uploads and
+     the persistent buffers, the frame upload allocator, the constant arena
+     and its maps, the index buffer caches. State bound to a command buffer
+     (draw state cache, UBO binding, shared-constant memo, merge override)
+     exists once per thread.
+   - Any probe, trace, label or profile that records around single draws
+     keeps the frame on one thread: see the `parallel_pass_frame` condition.
+     If the feature seems to do nothing, check that list first, then whether
+     the shadow draws really are one colorless run (a clear or a marker
+     between them splits it; shorter pieces fall under the minimum).
+   - Expected, not measured: the recorder loses the `RecordIndexedPrimitive`
+     share of the shadow draws, about a third of its frame.
+   - Things to verify on the device: the proprietary Adreno driver with a
+     frame of several primary command buffers; that the shadow map is
+     complete (no missing casters); the frame rate at the clock floor; no
+     new hitching from the lock while a pipeline compiles.
+   - **Record the PGO profile again after this change.** The edited recorder
+     functions no longer match the profile and are compiled without it (89
+     "hash mismatch" warnings, among them `RecordNativeFrame`,
+     `RecordIndexedPrimitive` and `BindCommonDrawState`): a build from this
+     tree is slower than the one recorded before it until then, with the
+     feature on or off.
+
 ## Open
 
-- Measure the installed build (PGO, recorder-first pinning, sleep at the clock
-  floor) at thermal status 4 and at the clock floor. Before PGO the floor gave
-  21-24 FPS; the recorder needs about 33 ms per frame there to hold 30.
-- If that is not enough: the recorder is one thread on a phone with spare
+- The optimized build (PGO recorded after the per-draw pass, 2026-10-13) holds
+  30 FPS at 4,000-5,800 draws while a cluster has 2.2 GHz or more, and gives
+  20-22 FPS at the clock floor at about 3,300 draws (1,900 of them shadow
+  map draws), the recorder at 84% of a core, about 40 ms per frame. Before
+  PGO the floor gave 21-24 FPS in another scene: the floor is not solved,
+  and the recorder needs about 33 ms per frame there to hold 30.
+- The recorder is one thread on a phone with spare
   cores (3.85 of 7 busy). The shadow map pass is 1,500-2,300 of the 3,000-
   5,500 draws of a frame (`c0x0/d1280x1280` in the `gta4-draw-census` line)
   and a candidate for recording on a second thread into its own command

@@ -281,6 +281,15 @@ REXCVAR_DEFINE_UINT32(gta4_native_debug_gpu_attribution, 0, "GTA IV/Graphics/Nat
 REXCVAR_DEFINE_BOOL(gta4_native_merge_indexed_draws, true, "GTA IV/Graphics/Native Renderer",
                     "Record consecutive indexed triangle-list draws with identical state and "
                     "adjacent index ranges as one draw");
+// Untested on a device (2026-10-13): off until it is.
+REXCVAR_DEFINE_BOOL(gta4_native_parallel_shadow_recording, false,
+                    "GTA IV/Graphics/Native Renderer",
+                    "Record long depth-only passes (the shadow map) on a second thread, into "
+                    "command buffers of their own");
+REXCVAR_DEFINE_UINT32(gta4_native_parallel_shadow_min_draws, 256,
+                      "GTA IV/Graphics/Native Renderer",
+                      "Shortest run of depth-only indexed draws the second thread records")
+    .range(16, 65536);
 REXCVAR_DEFINE_DOUBLE(gta4_native_depth_bias_constant_scale, 1.0, "GTA IV/Graphics/Native Renderer",
                       "Multiplier on the converted constant depth bias (diagnostics)");
 REXCVAR_DEFINE_DOUBLE(gta4_native_depth_bias_slope_scale, 1.0, "GTA IV/Graphics/Native Renderer",
@@ -562,6 +571,9 @@ extern "C" __attribute__((visibility("default"))) int rex_gta4_native_memory_pro
 }
 
 namespace {
+
+// Set on the thread that records parallel passes (ParallelPassThreadMain).
+thread_local bool t_parallel_pass_thread = false;
 
 // Per-frame stage times (gta4_native_frame_timeline). Indexed by guest frame
 // number; each stage writes its own slot, the recorder logs the frame after
@@ -8909,6 +8921,7 @@ bool Gta4NativeGraphicsSystem::GetOrCreatePersistentBuffer(
     const NativePersistentBufferKey& key, const uint8_t* source, VkDeviceSize size,
     NativeUploadKind upload_kind, NativeUploadAllocation& allocation) {
   const profile::CpuScope profile_scope(profile::CpuOp::kPersistentBuffer);
+  const auto parallel_pass_lock = LockParallelPass();
 
   if (!REXCVAR_GET(gta4_native_persistent_buffers) || !command_buffer || !owner || !source ||
       !size) {
@@ -8989,6 +9002,15 @@ bool Gta4NativeGraphicsSystem::GetOrCreatePersistentBuffer(
   }
 
   NativePersistentBufferBlock& block = block_entry->second;
+  if (!block.mapping && t_parallel_pass_thread) {
+    // The copy into an unmapped block is a transfer command, and this thread's
+    // command buffer is inside a rendering scope: use the frame upload instead.
+    const NativeBufferArenaRelease release = persistent_buffer_arena_->Release(reserved.id);
+    if (release && release.destroy_block) {
+      DestroyNativePersistentBufferBlock(release.block_id);
+    }
+    return false;
+  }
   if (block.mapping) {
     std::memcpy(block.mapping + reserved.offset, source, size_t(size));
     ui::vulkan::util::FlushMappedMemoryRange(
@@ -9210,6 +9232,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
 bool Gta4NativeGraphicsSystem::FindFrameConstantBuffer(NativeConstantBufferKind kind,
                                                        uint64_t immutable_identity,
                                                        NativeUploadAllocation& allocation) const {
+  const auto parallel_pass_lock = LockParallelPass();
   if (active_frame_slot_ >= frame_constant_arenas_.size() || !immutable_identity) {
     return false;
   }
@@ -9237,6 +9260,7 @@ bool Gta4NativeGraphicsSystem::GetOrCreateFrameConstantBuffer(NativeConstantBuff
                                                               NativeUploadAllocation& allocation,
                                                               size_t reserve_bytes) {
   const profile::CpuScope profile_scope(profile::CpuOp::kConstantBind);
+  const auto parallel_pass_lock = LockParallelPass();
 
   if (active_frame_slot_ >= frame_constant_arenas_.size() || !immutable_identity ||
       source_bytes.empty()) {
@@ -9641,6 +9665,10 @@ bool Gta4NativeGraphicsSystem::RecoverFailedNativeFrameRecording() {
     native_renderer_recovery_failed_ = true;
     RollbackActiveNativeFrameSlot();
     return false;
+  }
+  // The frame's parallel passes were joined when its recording returned.
+  if (const VkCommandPool pool = parallel_pass_slots_[active_frame_slot_ & 1].pool) {
+    dfn.vkResetCommandPool(device, pool, 0);
   }
   RollbackActiveNativeFrameSlot();
   if (frame_context_tokens_[active_frame_slot_] ||
@@ -11233,6 +11261,8 @@ bool Gta4NativeGraphicsSystem::IsNativeGpuProfileFrameActive() const {
 
 void Gta4NativeGraphicsSystem::AddNativeGpuProfileCounter(performance::Counter counter,
                                                           uint64_t value) {
+  // The sample builder belongs to the recorder thread; a parallel pass is not counted.
+  if (t_parallel_pass_thread) return;
   if (active_frame_slot_ < native_gpu_profile_state_.frames.size()) {
     native_gpu_profile_state_.frames[active_frame_slot_].sample_builder.AddCounter(counter, value);
   }
@@ -16897,6 +16927,7 @@ bool Gta4NativeGraphicsSystem::AllocateUpload(VkDeviceSize size, VkDeviceSize al
                                               NativeUploadAllocation& allocation,
                                               NativeUploadKind kind) {
   const profile::CpuScope profile_scope(profile::CpuOp::kUploadAllocate);
+  const auto parallel_pass_lock = LockParallelPass();
 
   if (!size || !upload_buffer_.mapping || !alignment || !rex::is_pow2(alignment)) {
     return false;
@@ -20983,6 +21014,7 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreateDrawPipeline(
     const NativeCommand& command, uint32_t primitive_type, const NativeRenderingTarget& target,
     uint32_t user_pointer_stride, bool primitive_restart_enable, bool prewarm) {
   const profile::CpuScope profile_scope(profile::CpuOp::kPipelineLookup);
+  const auto parallel_pass_lock = LockParallelPass();
 
   if (!command.pipeline_state) {
     return VK_NULL_HANDLE;
@@ -22022,6 +22054,7 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
     bool index_buffer, bool index32, const NativePipelineState* vertex_state,
     uint32_t vertex_stream, NativeFrameResources& resources, NativeUploadAllocation& allocation) {
   const profile::CpuScope profile_scope(profile::CpuOp::kBufferUpload);
+  const auto parallel_pass_lock = LockParallelPass();
 
   if (!resource || resource->payload.empty()) {
     return false;
@@ -22206,6 +22239,15 @@ bool Gta4NativeGraphicsSystem::BindUboConstantBanks(VkCommandBuffer command_buff
   if (active_frame_slot_ >= ubo_constants_sets_.size() || !ubo_constants_sets_[active_frame_slot_]) {
     return true;  // Layout without the uniform banks: nothing to bind.
   }
+  // The set's buffer is shared; what is bound belongs to a command buffer.
+  const auto parallel_pass_lock = LockParallelPass();
+  const bool parallel_pass = t_parallel_pass_thread;
+  VkPipelineLayout& ubo_bound_layout = parallel_pass ? parallel_pass_ubo_layout_ : ubo_bound_layout_;
+  VkDescriptorSet& ubo_bound_set = parallel_pass ? parallel_pass_ubo_set_ : ubo_bound_set_;
+  VkCommandBuffer& ubo_bound_command_buffer =
+      parallel_pass ? parallel_pass_ubo_command_buffer_ : ubo_bound_command_buffer_;
+  std::array<uint32_t, 2>& ubo_bound_offsets =
+      parallel_pass ? parallel_pass_ubo_offsets_ : ubo_bound_offsets_;
   const NativeFrameConstantArena& arena = frame_constant_arenas_[active_frame_slot_];
   if (!arena.storage.buffer || vertex.buffer != arena.storage.buffer ||
       pixel.buffer != arena.storage.buffer) {
@@ -22233,12 +22275,12 @@ bool Gta4NativeGraphicsSystem::BindUboConstantBanks(VkCommandBuffer command_buff
     dfn.vkUpdateDescriptorSets(vulkan_device->device(), uint32_t(writes.size()), writes.data(), 0,
                                nullptr);
     ubo_constants_set_buffers_[active_frame_slot_] = arena.storage.buffer;
-    ubo_bound_layout_ = VK_NULL_HANDLE;
+    ubo_bound_layout = VK_NULL_HANDLE;
   }
   const std::array<uint32_t, 2> offsets = {uint32_t(vertex.offset), uint32_t(pixel.offset)};
-  if (!REXCVAR_GET(gta4_native_ubo_bind_always) && ubo_bound_layout_ == layout &&
-      ubo_bound_set_ == set && ubo_bound_offsets_ == offsets &&
-      ubo_bound_command_buffer_ == command_buffer) {
+  if (!REXCVAR_GET(gta4_native_ubo_bind_always) && ubo_bound_layout == layout &&
+      ubo_bound_set == set && ubo_bound_offsets == offsets &&
+      ubo_bound_command_buffer == command_buffer) {
     return true;
   }
   dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
@@ -22267,10 +22309,10 @@ bool Gta4NativeGraphicsSystem::BindUboConstantBanks(VkCommandBuffer command_buff
     ++binds;
   }
 #endif
-  ubo_bound_layout_ = layout;
-  ubo_bound_set_ = set;
-  ubo_bound_offsets_ = offsets;
-  ubo_bound_command_buffer_ = command_buffer;
+  ubo_bound_layout = layout;
+  ubo_bound_set = set;
+  ubo_bound_offsets = offsets;
+  ubo_bound_command_buffer = command_buffer;
   return true;
 }
 
@@ -22282,6 +22324,15 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
   const profile::CpuScope profile_scope(profile::CpuOp::kCommonBindings);
 
   (void)resources;
+  // What is bound belongs to a command buffer: one set per recording thread.
+  const bool parallel_pass = t_parallel_pass_thread;
+  NativeDrawStateCache<2>& draw_state_cache = RecorderDrawState();
+  NativeSharedConstantSemanticKey& shared_memo_key =
+      parallel_pass ? parallel_pass_shared_memo_key_ : shared_constant_memo_key_;
+  NativeUploadAllocation& shared_memo_allocation =
+      parallel_pass ? parallel_pass_shared_memo_allocation_ : shared_constant_memo_allocation_;
+  bool& shared_memo_valid =
+      parallel_pass ? parallel_pass_shared_memo_valid_ : shared_constant_memo_valid_;
   if (!command.bindings_prepared || command.failed_texture_mask) {
     TraceNativeRendererEvent("draw-rejected", "reason=required-binding-realization");
     return false;
@@ -22357,10 +22408,14 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
     }
     return result != Binding::Result::kFailure;
   };
-  if (!bind_guest_constants(NativeConstantBufferKind::kVertex, command.shader_state->vertex_constants,
-                             vertex_constants_allocation, vertex_constants) ||
-      !bind_guest_constants(NativeConstantBufferKind::kPixel, command.shader_state->pixel_constants,
-                             pixel_constants_allocation, pixel_constants)) return false;
+  {
+    // The slot's constant arena and its binding maps serve both recording threads.
+    const auto parallel_pass_lock = LockParallelPass();
+    if (!bind_guest_constants(NativeConstantBufferKind::kVertex, command.shader_state->vertex_constants,
+                               vertex_constants_allocation, vertex_constants) ||
+        !bind_guest_constants(NativeConstantBufferKind::kPixel, command.shader_state->pixel_constants,
+                               pixel_constants_allocation, pixel_constants)) return false;
+  }
   const uint64_t bound_vertex_shader_hash =
       command.pipeline_state && command.pipeline_state->vertex_shader_resource
           ? command.pipeline_state->vertex_shader_resource->hash
@@ -22485,6 +22540,10 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
         -vulkan_device->properties().maxSamplerLodBias, vulkan_device->properties().maxSamplerLodBias));
   }
   shared_key.cached_descriptor_epoch = command.cached_descriptor_epoch;
+  const auto fusion_tone_lut_lock =
+      modern_shader_frame_.settings().enabled && !fusion_tone_lut_.buffer
+          ? LockParallelPass()
+          : std::unique_lock<std::recursive_mutex>();
   if (modern_shader_frame_.settings().enabled && !fusion_tone_lut_.buffer) {
     if (!CreateNativeUploadBuffer(sizeof(kFusionToneLut), fusion_tone_lut_, true)) return false;
     std::memcpy(fusion_tone_lut_.mapping, kFusionToneLut.data(), sizeof(kFusionToneLut));
@@ -22548,9 +22607,10 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
   // (a ~1 KB word pack + XXH3 + bucket walk per draw); the key's operator==
   // is the same authoritative test the map applies after a hash match. The
   // cached allocation's arena reservation is stable for the whole frame.
-  if (shared_constant_memo_valid_ && shared_constant_memo_key_ == shared_key) {
-    shared_constants_allocation = shared_constant_memo_allocation_;
+  if (shared_memo_valid && shared_memo_key == shared_key) {
+    shared_constants_allocation = shared_memo_allocation;
   } else {
+  const auto parallel_pass_lock = LockParallelPass();
   if (active_frame_slot_ >= frame_constant_arenas_.size()) {
     return false;
   }
@@ -22636,9 +22696,9 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
       return false;
     }
   }
-  shared_constant_memo_key_ = shared_key;
-  shared_constant_memo_allocation_ = shared_constants_allocation;
-  shared_constant_memo_valid_ = true;
+  shared_memo_key = shared_key;
+  shared_memo_allocation = shared_constants_allocation;
+  shared_memo_valid = true;
   }
 
   static const bool trace_glass_output = [] {
@@ -22693,14 +22753,14 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
 #if REX_PLATFORM_ANDROID
   if (pipeline_stats_.ready()) pipeline_stats_.Observe(pipeline);
 #endif
-  if (native_draw_state_cache_.UpdatePipeline(NativeVulkanHandleIdentity(pipeline))) {
+  if (draw_state_cache.UpdatePipeline(NativeVulkanHandleIdentity(pipeline))) {
     profile::CpuCall(profile::CpuOp::kDriverBind, [&] { return dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); });
   }
   std::array<uint64_t, kDescriptorSetCount> descriptor_identities{};
   std::transform(draw_descriptor_sets.begin(), draw_descriptor_sets.end(),
                   descriptor_identities.begin(),
                   [](VkDescriptorSet set) { return NativeVulkanHandleIdentity(set); });
-  if (native_draw_state_cache_.UpdateDescriptors(
+  if (draw_state_cache.UpdateDescriptors(
           NativeVulkanHandleIdentity(draw_pipeline_layout), descriptor_identities)) {
     profile::CpuCall(profile::CpuOp::kDriverBind, [&] { return dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 draw_pipeline_layout, 0, kDescriptorSetCount,
@@ -22714,7 +22774,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
       viewport_scale_x, viewport_scale_y, width, height,
       vulkan_provider->vulkan_device()->properties());
   const VkViewport& viewport = viewport_selection.viewport;
-  if (native_draw_state_cache_.UpdateViewport(
+  if (draw_state_cache.UpdateViewport(
           {std::bit_cast<uint32_t>(viewport.x), std::bit_cast<uint32_t>(viewport.y),
            std::bit_cast<uint32_t>(viewport.width), std::bit_cast<uint32_t>(viewport.height),
            std::bit_cast<uint32_t>(viewport.minDepth), std::bit_cast<uint32_t>(viewport.maxDepth)})) {
@@ -22741,7 +22801,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
   if (viewport_selection.empty || REXCVAR_GET(gta4_native_debug_gpu_attribution) == 1) {
     scissor = {};
   }
-  if (native_draw_state_cache_.UpdateScissor(
+  if (draw_state_cache.UpdateScissor(
           {scissor.offset.x, scissor.offset.y, scissor.extent.width, scissor.extent.height})) {
     profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdSetScissor(command_buffer, 0, 1, &scissor); });
   }
@@ -22783,7 +22843,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
                                  xenos::kPolygonOffsetScaleSubpixelUnit *
                                  NativeResolutionDepthBiasScale(viewport_scale_x, viewport_scale_y) *
                                  float(REXCVAR_GET(gta4_native_depth_bias_slope_scale));
-  if (native_draw_state_cache_.UpdateDepthBias(
+  if (draw_state_cache.UpdateDepthBias(
           {std::bit_cast<uint32_t>(depth_bias_constant), std::bit_cast<uint32_t>(0.0f),
            std::bit_cast<uint32_t>(depth_bias_slope)})) {
     profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdSetDepthBias(command_buffer, depth_bias_constant, 0.0f, depth_bias_slope); });
@@ -22814,7 +22874,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
   }
   const NativeStencilMaskRefState& effective_back_stencil =
       stencil_mask_ref.use_separate_faces ? stencil_mask_ref.back : stencil_mask_ref.front;
-  if (native_draw_state_cache_.UpdateStencil(
+  if (draw_state_cache.UpdateStencil(
           {stencil_mask_ref.front.reference, stencil_mask_ref.front.compare_mask,
            stencil_mask_ref.front.write_mask, effective_back_stencil.reference,
            effective_back_stencil.compare_mask, effective_back_stencil.write_mask})) {
@@ -22848,7 +22908,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
   if (!blend_constants.representable) {
     return false;
   }
-  if (native_draw_state_cache_.UpdateBlendConstants(
+  if (draw_state_cache.UpdateBlendConstants(
           std::bit_cast<std::array<uint32_t, 4>>(blend_constants.constants))) {
     profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdSetBlendConstants(command_buffer, blend_constants.constants.data()); });
   }
@@ -22885,8 +22945,8 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
   if (target.temporal_shader) {
     if (!BindTemporalDraw(command_buffer, command, target, draw_pipeline_layout,
           vertex_constants_allocation, pixel_constants_allocation, shared_constants_allocation)) return false;
-    native_draw_state_cache_.Reset(); ubo_bound_layout_ = VK_NULL_HANDLE;
-  } else if (native_draw_state_cache_.UpdatePushConstants(
+    draw_state_cache.Reset(); ubo_bound_layout_ = VK_NULL_HANDLE;
+  } else if (draw_state_cache.UpdatePushConstants(
           NativeVulkanHandleIdentity(draw_pipeline_layout),
           {push_constants.vertex_constants, push_constants.pixel_constants,
            push_constants.shared_constants})) {
@@ -23357,6 +23417,7 @@ bool Gta4NativeGraphicsSystem::GetRequiredVertexStreams(
     std::array<bool, kVertexStreamCount>& required_streams) const {
   // Pure over two immutable snapshot objects; memoize on the state instead of
   // re-running the inputs x elements location match for every draw.
+  const auto parallel_pass_lock = LockParallelPass();
   if (state.required_streams_memo != NativePipelineState::kRequiredStreamsMemoUncomputed) {
     const bool valid = (state.required_streams_memo & (1u << 31)) != 0;
     for (uint32_t stream = 0; stream < kVertexStreamCount; ++stream) {
@@ -23529,7 +23590,7 @@ void Gta4NativeGraphicsSystem::BindNativeVertexBuffer(VkCommandBuffer command_bu
                                                       VkDeviceSize offset) {
   // The cache is always updated, so turning the option back on cannot trust
   // a binding it did not see.
-  const bool changed = native_draw_state_cache_.UpdateVertexBuffer(
+  const bool changed = RecorderDrawState().UpdateVertexBuffer(
       NativeVulkanHandleIdentity(command_buffer), binding, NativeVulkanHandleIdentity(buffer),
       uint64_t(offset));
   if (!changed && REXCVAR_GET(gta4_native_dedupe_vertex_bindings)) return;
@@ -23564,7 +23625,9 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
   }
   DrawIndexedPrimitiveCommand draw{};
   std::memcpy(&draw, command.bytes.data(), sizeof(draw));
-  if (indexed_merge_count_override_) draw.index_count = indexed_merge_count_override_;
+  const uint32_t merge_count_override =
+      t_parallel_pass_thread ? parallel_pass_merge_override_ : indexed_merge_count_override_;
+  if (merge_count_override) draw.index_count = merge_count_override;
   if (!draw.index_count) {
     return fail("zero-index-count");
   }
@@ -23633,6 +23696,9 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
     return fail("index-bounds");
   }
   NativeUploadAllocation index_allocation;
+  // The index buffer's converted, fan and vertex-cache copies are caches on
+  // the resource, which both recording threads may draw from.
+  auto index_cache_lock = LockParallelPass();
   if (draw.primitive_type == uint32_t(xenos::PrimitiveType::kTriangleFan)) {
     auto& host = index32 ? command.index_buffer->host_index32_payload
                          : command.index_buffer->host_index16_payload;
@@ -23806,6 +23872,7 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
       }
     }
   }
+  if (index_cache_lock.owns_lock()) index_cache_lock.unlock();
   if (guest_restart_enabled && draw.primitive_type != uint32_t(xenos::PrimitiveType::kTriangleFan)) {
     const VkDeviceSize restart_size = VkDeviceSize(host_index_count) * element_size;
     if (!AllocateUpload(restart_size, size_t(element_size), primitive_restart_indices,
@@ -28740,6 +28807,287 @@ bool Gta4NativeGraphicsSystem::IsHoveGantryGeometryCandidate(const NativeCommand
              [](const NativePipelineState::VertexStream& stream) { return stream.stride == 24; });
 }
 
+NativeDrawStateCache<2>& Gta4NativeGraphicsSystem::RecorderDrawState() {
+  return t_parallel_pass_thread ? parallel_pass_draw_state_ : native_draw_state_cache_;
+}
+
+bool Gta4NativeGraphicsSystem::EnsureParallelPassSlot() {
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const ui::vulkan::VulkanDevice* vulkan_device = vulkan_provider->vulkan_device();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ParallelPassSlot& slot = parallel_pass_slots_[active_frame_slot_ & 1];
+  VkCommandBufferAllocateInfo allocate_info{};
+  allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  allocate_info.commandBufferCount = kParallelPassSegments;
+  if (!slot.pool) {
+    // A pool of its own: the second thread records while this one does.
+    VkCommandPoolCreateInfo pool_info{};
+    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_info.queueFamilyIndex = vulkan_device->queue_family_native_offscreen();
+    VkCommandPool pool = VK_NULL_HANDLE;
+    if (dfn.vkCreateCommandPool(device, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+      return false;
+    }
+    allocate_info.commandPool = pool;
+    if (dfn.vkAllocateCommandBuffers(device, &allocate_info, slot.pass_command_buffers.data()) !=
+        VK_SUCCESS) {
+      dfn.vkDestroyCommandPool(device, pool, nullptr);
+      slot.pass_command_buffers = {};
+      return false;
+    }
+    slot.pool = pool;
+  }
+  if (!slot.main_allocated) {
+    if (!command_pool_) return false;
+    allocate_info.commandPool = command_pool_;
+    if (dfn.vkAllocateCommandBuffers(device, &allocate_info, slot.main_command_buffers.data()) !=
+        VK_SUCCESS) {
+      slot.main_command_buffers = {};
+      return false;
+    }
+    slot.main_allocated = true;
+  }
+  if (parallel_pass_queue_.empty()) parallel_pass_queue_.resize(kParallelPassQueueSize);
+  if (!parallel_pass_thread_.joinable()) {
+    parallel_pass_stop_.store(false, std::memory_order_relaxed);
+    parallel_pass_thread_ = std::thread([this] { ParallelPassThreadMain(); });
+  }
+  return true;
+}
+
+bool Gta4NativeGraphicsSystem::BeginParallelPassSegment(const VkRenderingInfo& info,
+                                                        VkCommandBuffer& command_buffer) {
+  if (parallel_pass_segment_open_ || parallel_pass_segment_count_ >= kParallelPassSegments ||
+      info.pNext || info.colorAttachmentCount > 7 ||
+      parallel_pass_failed_.load(std::memory_order_relaxed) || !EnsureParallelPassSlot()) {
+    return false;
+  }
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const auto& dfn = vulkan_provider->vulkan_device()->functions();
+  const ParallelPassSlot& slot = parallel_pass_slots_[active_frame_slot_ & 1];
+  const uint32_t index = parallel_pass_segment_count_;
+
+  // This thread's command buffer is complete up to the scope; what it
+  // records from here on runs after the scope, in its next one.
+  const VkCommandBuffer next = slot.main_command_buffers[index];
+  VkCommandBufferBeginInfo begin_info{};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (dfn.vkBeginCommandBuffer(next, &begin_info) != VK_SUCCESS) {
+    return false;
+  }
+  if (dfn.vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
+    parallel_pass_failed_.store(true, std::memory_order_relaxed);
+    return false;
+  }
+  command_buffer = next;
+  parallel_pass_tail_ = next;
+  // Nothing is bound in the new command buffer.
+  native_draw_state_cache_.Reset();
+  ubo_bound_layout_ = VK_NULL_HANDLE;
+
+  ParallelPassSegment& segment = parallel_pass_segments_[index];
+  segment.info = info;
+  segment.colors = {};
+  for (uint32_t color = 0; color < info.colorAttachmentCount; ++color) {
+    segment.colors[color] = info.pColorAttachments[color];
+  }
+  segment.info.pColorAttachments = info.colorAttachmentCount ? segment.colors.data() : nullptr;
+  if (info.pDepthAttachment) {
+    segment.depth = *info.pDepthAttachment;
+    segment.info.pDepthAttachment = &segment.depth;
+  }
+  if (info.pStencilAttachment) {
+    segment.stencil = *info.pStencilAttachment;
+    segment.info.pStencilAttachment = &segment.stencil;
+  }
+  segment.command_buffer = slot.pass_command_buffers[index];
+
+  ++parallel_pass_segment_count_;
+  parallel_pass_segment_open_ = true;
+  // From here until FinishParallelPass both threads lock the shared state.
+  parallel_pass_active_.store(true, std::memory_order_seq_cst);
+  ParallelPassJob job{};
+  job.kind = ParallelPassJob::Kind::kBegin;
+  job.segment = index;
+  PushParallelPassJob(job);
+  return true;
+}
+
+void Gta4NativeGraphicsSystem::QueueParallelPassDraw(const NativeCommand& command,
+                                                     const NativeRenderingTarget& target,
+                                                     uint32_t merged_count,
+                                                     uint32_t merged_indices, bool wait) {
+  // The scope's draws nearly always share one resolved target.
+  static_assert(std::is_trivially_copyable_v<NativeRenderingTarget>);
+  if (parallel_pass_targets_.empty() ||
+      std::memcmp(parallel_pass_targets_.back().get(), &target, sizeof(target)) != 0) {
+    parallel_pass_targets_.push_back(std::make_unique<NativeRenderingTarget>(target));
+  }
+  ParallelPassJob job{};
+  job.kind = ParallelPassJob::Kind::kDraw;
+  job.segment = parallel_pass_segment_count_ - 1;
+  job.command = &command;
+  job.target = parallel_pass_targets_.back().get();
+  job.merged_count = merged_count;
+  job.merged_indices = merged_indices;
+  PushParallelPassJob(job);
+  if (wait) WaitForParallelPass();
+}
+
+void Gta4NativeGraphicsSystem::EndParallelPassSegment() {
+  if (!parallel_pass_segment_open_) return;
+  parallel_pass_segment_open_ = false;
+  ParallelPassJob job{};
+  job.kind = ParallelPassJob::Kind::kEnd;
+  job.segment = parallel_pass_segment_count_ - 1;
+  PushParallelPassJob(job);
+}
+
+void Gta4NativeGraphicsSystem::FinishParallelPass() {
+  if (!parallel_pass_active_.load(std::memory_order_relaxed)) return;
+  EndParallelPassSegment();
+  WaitForParallelPass();
+  // The second thread is idle: the shared state is this thread's alone again.
+  parallel_pass_active_.store(false, std::memory_order_seq_cst);
+}
+
+void Gta4NativeGraphicsSystem::PushParallelPassJob(const ParallelPassJob& job) {
+  const uint32_t tail = parallel_pass_queue_tail_.load(std::memory_order_relaxed);
+  while (tail - parallel_pass_queue_head_.load(std::memory_order_acquire) >=
+         kParallelPassQueueSize) {
+    std::this_thread::yield();
+  }
+  parallel_pass_queue_[tail & (kParallelPassQueueSize - 1)] = job;
+  ++parallel_pass_jobs_pushed_;
+  parallel_pass_queue_tail_.store(tail + 1, std::memory_order_seq_cst);
+  if (parallel_pass_parked_.load(std::memory_order_seq_cst)) {
+    std::lock_guard lock(parallel_pass_wake_mutex_);
+    parallel_pass_wake_.notify_one();
+  }
+}
+
+void Gta4NativeGraphicsSystem::WaitForParallelPass() {
+  // This thread has nothing else to record; the wait is at most the tail of
+  // one pass.
+  while (parallel_pass_jobs_done_.load(std::memory_order_acquire) != parallel_pass_jobs_pushed_) {
+    std::this_thread::yield();
+  }
+}
+
+void Gta4NativeGraphicsSystem::ParallelPassThreadMain() {
+#if REX_PLATFORM_ANDROID
+  pthread_setname_np(pthread_self(), "GtaPassRecorder");
+#endif
+  t_parallel_pass_thread = true;
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const auto& dfn = vulkan_provider->vulkan_device()->functions();
+  // Whether the open segment's command buffer accepts commands.
+  bool recording = false;
+  for (;;) {
+    const uint32_t head = parallel_pass_queue_head_.load(std::memory_order_relaxed);
+    if (head == parallel_pass_queue_tail_.load(std::memory_order_acquire)) {
+      if (parallel_pass_stop_.load(std::memory_order_acquire)) return;
+      // Draws arrive every few microseconds during a pass: spin through the
+      // gaps, sleep between passes.
+      bool found = false;
+      for (uint32_t spin = 0; spin < 4000 && !found; ++spin) {
+        found = head != parallel_pass_queue_tail_.load(std::memory_order_acquire);
+      }
+      if (!found) {
+        std::unique_lock lock(parallel_pass_wake_mutex_);
+        parallel_pass_parked_.store(true, std::memory_order_seq_cst);
+        parallel_pass_wake_.wait(lock, [&] {
+          return head != parallel_pass_queue_tail_.load(std::memory_order_seq_cst) ||
+                 parallel_pass_stop_.load(std::memory_order_acquire);
+        });
+        parallel_pass_parked_.store(false, std::memory_order_seq_cst);
+      }
+      continue;
+    }
+    const ParallelPassJob job = parallel_pass_queue_[head & (kParallelPassQueueSize - 1)];
+    const ParallelPassSegment& segment = parallel_pass_segments_[job.segment];
+    switch (job.kind) {
+      case ParallelPassJob::Kind::kBegin: {
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        recording = dfn.vkBeginCommandBuffer(segment.command_buffer, &begin_info) == VK_SUCCESS;
+        if (!recording) {
+          parallel_pass_failed_.store(true, std::memory_order_relaxed);
+          break;
+        }
+        // Nothing is bound in the new command buffer; the constant arena
+        // behind the memo is the frame's.
+        parallel_pass_draw_state_.Reset();
+        parallel_pass_ubo_layout_ = VK_NULL_HANDLE;
+        parallel_pass_shared_memo_valid_ = false;
+        dfn.vkCmdBeginRendering(segment.command_buffer, &segment.info);
+        break;
+      }
+      case ParallelPassJob::Kind::kDraw: {
+        if (!recording) break;
+        const NativeRenderingTarget& target = *job.target;
+        parallel_pass_merge_override_ = job.merged_count > 1 ? job.merged_indices : 0;
+        const bool recorded =
+            RecordIndexedPrimitive(segment.command_buffer, *job.command, target.width,
+                                   target.height, target, recording_resources_);
+        parallel_pass_merge_override_ = 0;
+        if (!recorded && job.merged_count > 1) {
+          // As on the recorder thread: the merged draws one by one. They are
+          // consecutive commands of the frame.
+          for (uint32_t merged = 0; merged < job.merged_count; ++merged) {
+            RecordIndexedPrimitive(segment.command_buffer, job.command[merged], target.width,
+                                   target.height, target, recording_resources_);
+          }
+        }
+        break;
+      }
+      case ParallelPassJob::Kind::kEnd: {
+        if (!recording) break;
+        recording = false;
+        dfn.vkCmdEndRendering(segment.command_buffer);
+        if (dfn.vkEndCommandBuffer(segment.command_buffer) != VK_SUCCESS) {
+          parallel_pass_failed_.store(true, std::memory_order_relaxed);
+        }
+        break;
+      }
+    }
+    parallel_pass_queue_head_.store(head + 1, std::memory_order_release);
+    parallel_pass_jobs_done_.fetch_add(1, std::memory_order_release);
+  }
+}
+
+void Gta4NativeGraphicsSystem::StopParallelPassThread() {
+  if (!parallel_pass_thread_.joinable()) return;
+  FinishParallelPass();
+  parallel_pass_stop_.store(true, std::memory_order_release);
+  {
+    std::lock_guard lock(parallel_pass_wake_mutex_);
+    parallel_pass_wake_.notify_one();
+  }
+  parallel_pass_thread_.join();
+}
+
+void Gta4NativeGraphicsSystem::DestroyParallelPassObjects() {
+  // The slots' main command buffers go with their command_pool_.
+  FinishParallelPass();
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const ui::vulkan::VulkanDevice* vulkan_device =
+      vulkan_provider ? vulkan_provider->vulkan_device() : nullptr;
+  for (ParallelPassSlot& slot : parallel_pass_slots_) {
+    if (slot.pool && vulkan_device) {
+      vulkan_device->functions().vkDestroyCommandPool(vulkan_device->device(), slot.pool, nullptr);
+    }
+    slot = {};
+  }
+  parallel_pass_segment_count_ = 0;
+  parallel_pass_tail_ = VK_NULL_HANDLE;
+}
+
 bool Gta4NativeGraphicsSystem::RecordNativeFrame(
     VkCommandBuffer command_buffer, uint32_t width, uint32_t height, VkImage presenter_image,
     VkImageView presenter_view, uint32_t submitted_frame,
@@ -28913,6 +29261,21 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
   };
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const auto& dfn = vulkan_provider->vulkan_device()->functions();
+  // The previous frame's parallel passes were joined before it was submitted,
+  // and this slot's submission completed before recording restarted on it.
+  parallel_pass_segment_count_ = 0;
+  parallel_pass_segment_open_ = false;
+  parallel_pass_tail_ = VK_NULL_HANDLE;
+  parallel_pass_failed_.store(false, std::memory_order_relaxed);
+  parallel_pass_targets_.clear();
+  if (const VkCommandPool pool = parallel_pass_slots_[active_frame_slot_ & 1].pool) {
+    if (dfn.vkResetCommandPool(vulkan_provider->vulkan_device()->device(), pool, 0) != VK_SUCCESS) {
+      return false;
+    }
+  }
+  // After reset_recording_resources: the second thread is done before the
+  // frame's upload memos are invalidated, on every way out of this function.
+  const auto finish_parallel_pass = MakeScopeExit([this] { FinishParallelPass(); });
   std::optional<NativeGpuScopeSummary> gpu_scope_storage;
   const bool profile_scopes = gpu_labels::Available(vulkan_provider->vulkan_device(), command_buffer);
   NativeGpuScopeSummary* const previous_gpu_summary = native_gpu_scope_summary_;
@@ -28922,9 +29285,15 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
   NativeProducerDepthResolveScan producer_depth_resolve_scan{};
   const auto end_rendering = [&](int site = 0) {
     if (site > 0 && site < int(g_rendering_end_sites.size())) ++g_rendering_end_sites[site];
-    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
-    gpu_labels::End(vulkan_provider->vulkan_device(), command_buffer);
-    if (profile_scopes) gpu_labels::EndSceneScope(vulkan_provider->vulkan_device(), command_buffer, *native_gpu_scope_summary_);
+    if (parallel_pass_segment_open_) {
+      // The scope is in the second thread's command buffer; this thread's is
+      // already the one that follows it.
+      EndParallelPassSegment();
+    } else {
+      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+      gpu_labels::End(vulkan_provider->vulkan_device(), command_buffer);
+      if (profile_scopes) gpu_labels::EndSceneScope(vulkan_provider->vulkan_device(), command_buffer, *native_gpu_scope_summary_);
+    }
     CompleteProducerDepthResolve(command_buffer, producer_depth_resolve);
   };
   XXH3_state_t* semantic_hash_state =
@@ -30401,6 +30770,65 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
     if (!resolved_again) RecordResolve(command_buffer, *deferred_frontbuffer_resolve_, submitted_frame);
     deferred_frontbuffer_resolve_.reset();
   }
+  // Parallel passes (gta4_native_parallel_shadow_recording): runs of
+  // depth-only indexed draws into one depth surface, long enough to be worth a
+  // second thread. The shadow map passes are such runs. Every probe, trace and
+  // profile that records around single draws keeps the frame on one thread.
+  std::vector<std::pair<size_t, size_t>> parallel_pass_ranges;
+  bool parallel_pass_frame =
+      REXCVAR_GET(gta4_native_parallel_shadow_recording) && !collect_frame_diagnostics &&
+      !diagnostic_frame && !trace_stages && !force_content_probe && !profile_scopes &&
+      !translucent_queries_active && !emission_trace_frame && !black_output_monitor_frame &&
+      !diagnostic_variants_enabled && !fire_frame_ && !bulb_trace_frame_ &&
+      !temporal_frame_prepared_ && !IsNativeFlightRecorderEnabled() && !gpu_labels::Enabled() &&
+      !modern_diagnostics_.enabled() && !PhoneTraceConfig().enabled &&
+      !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) &&
+      !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeProbes) &&
+      !(transition::IsEnabled() && transition::ActiveTransitionId());
+#if REX_PLATFORM_ANDROID
+  // Both write queries into the frame's one command buffer.
+  parallel_pass_frame = parallel_pass_frame && !pipeline_stats_.ready() &&
+                        !REXCVAR_GET(gta4_gpu_counters);
+#endif
+  if (parallel_pass_frame) {
+    const auto parallel_pass_draw = [](const NativeCommand& candidate) {
+      if (candidate.type != CommandType::kDrawIndexedPrimitive || !candidate.pipeline_state ||
+          !candidate.shader_state || !candidate.index_buffer || candidate.fire_trace ||
+          candidate.bulb_trace || candidate.phone_trace || candidate.tv_trace ||
+          candidate.temporal_scene_binding || candidate.temporal_instance ||
+          candidate.temporal_prefilter || IsLocalStencilSetup(candidate.lighting) ||
+          !candidate.pipeline_state->depth_stencil.handle ||
+          // Water surface draws are bracketed by an occlusion query.
+          (candidate.pipeline_state->pixel_shader_resource &&
+           candidate.pipeline_state->pixel_shader_resource->water_surface)) {
+        return false;
+      }
+      for (const SurfaceDescriptor& color : candidate.pipeline_state->render_targets) {
+        if (color.handle || color.address) return false;
+      }
+      return true;
+    };
+    const size_t minimum_draws = REXCVAR_GET(gta4_native_parallel_shadow_min_draws);
+    for (size_t first = 0; first < current_frame_.size();) {
+      if (!parallel_pass_draw(current_frame_[first])) {
+        ++first;
+        continue;
+      }
+      const SurfaceDescriptor& depth = current_frame_[first].pipeline_state->depth_stencil;
+      size_t last = first + 1;
+      while (last < current_frame_.size() && parallel_pass_draw(current_frame_[last]) &&
+             current_frame_[last].pipeline_state->depth_stencil.handle == depth.handle &&
+             current_frame_[last].pipeline_state->depth_stencil.address == depth.address) {
+        ++last;
+      }
+      if (last - first >= minimum_draws) parallel_pass_ranges.emplace_back(first, last);
+      first = last;
+    }
+    parallel_pass_frame = !parallel_pass_ranges.empty();
+  }
+  size_t parallel_pass_range = 0;
+  size_t parallel_pass_entered_range = SIZE_MAX;
+  bool parallel_pass_in_range = false;
   size_t merged_up_until = 0;
   std::vector<const NativeCommand*> up_run;
   // The recorder's time goes mostly to first touches of the ~3 KB commands
@@ -30500,6 +30928,26 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
           continue;
         }
       }
+    }
+    if (parallel_pass_frame) {
+      while (parallel_pass_range < parallel_pass_ranges.size() &&
+             command_index >= parallel_pass_ranges[parallel_pass_range].second) {
+        ++parallel_pass_range;
+      }
+      parallel_pass_in_range = parallel_pass_range < parallel_pass_ranges.size() &&
+                               command_index >= parallel_pass_ranges[parallel_pass_range].first;
+      // The second thread's scope holds nothing but the run's draws: it ends
+      // before any other command, and a scope this thread already opened on
+      // the run's target ends at the run's first draw, so that the run begins
+      // one of its own.
+      if (rendering &&
+          (parallel_pass_segment_open_
+               ? !parallel_pass_in_range
+               : parallel_pass_in_range && parallel_pass_entered_range != parallel_pass_range)) {
+        end_rendering(__LINE__);
+        rendering = false;
+      }
+      if (parallel_pass_in_range) parallel_pass_entered_range = parallel_pass_range;
     }
     const profile::CpuContextScope detail_command_context([&]() -> profile::CpuContext {
       const auto* profile_state = queued_command.pipeline_state.get();
@@ -34195,8 +34643,22 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
                              (stencil_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1u : 0u);
         ++g_light_reuse_failures[16 + key];
       }
+      // A run of depth-only draws begins in the second thread's command
+      // buffer; command_buffer then is the one recorded after it. No probe
+      // may split the scope again right below.
+      const bool parallel_pass_scope =
+          parallel_pass_frame && parallel_pass_in_range && &command == &queued_command &&
+          !target.color_attachment_mask && target.depth_stencil_attachment_active &&
+          target.depth_surface && !target.uses_presenter && !target.temporal_shader &&
+          !target.temporal_motion && !target.temporal_reactive && !target.temporal_jitter &&
+          !(fire_checkpoint || bulb_original_probe || bulb_interference_probe ||
+            selected_light_stencil_setup_draw || light_color_delta_draw || phone_probe_selected ||
+            tv_probe_selected) &&
+          BeginParallelPassSegment(rendering_info, command_buffer);
+      if (!parallel_pass_scope) {
       gpu_labels::BeginSceneScope(vulkan_provider->vulkan_device(), command_buffer, rendering_info, native_gpu_scope_summary_, submitted_frame, uint32_t(command_index));
       profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+      }
       // A load-op clear is itself a complete attachment write. Record it
       // immediately so a later scope break in the same reflection capture may
       // LOAD this frame's contents, while the first use in a future frame can
@@ -35237,10 +35699,24 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
           }
         }
       }
+      if (parallel_pass_segment_open_) {
+        // The scope is in the second thread's command buffer: so is the draw.
+        // A command that is not the frame's own does not outlive this
+        // iteration, and is waited for.
+        QueueParallelPassDraw(command, target, uint32_t(merged_count), merged_indices,
+                              &command != &queued_command);
+        command_recorded = true;
+        if (merged_count > 1) {
+          merged_up_until = command_index + merged_count;
+          g_indexed_draws_merged.fetch_add(merged_count - 1, std::memory_order_relaxed);
+        }
+        merged_count = 1;
+      } else {
       if (merged_count > 1) indexed_merge_count_override_ = merged_indices;
       command_recorded = RecordIndexedPrimitive(command_buffer, command, target.width,
                                                 target.height, target, resources);
       indexed_merge_count_override_ = 0;
+      }
       if (merged_count > 1) {
         if (command_recorded) {
           merged_up_until = command_index + merged_count;
@@ -36063,6 +36539,11 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
                      presenter_transfer_written ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
                                                 : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                      width, height, cloud_trace_frame || force_content_probe);
+  // The second thread writes uploads and constants until its last draw.
+  FinishParallelPass();
+  if (parallel_pass_failed_.load(std::memory_order_relaxed)) {
+    return false;
+  }
   if (upload_buffer_.write_offset) {
     ui::vulkan::util::FlushMappedMemoryRange(
         vulkan_provider->vulkan_device(), upload_buffer_.memory, upload_buffer_.memory_type, 0,
@@ -36812,11 +37293,29 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
               presenter_written);
         }
 
+        // A parallel pass left command buffers that can no longer be submitted.
+        if (parallel_pass_failed_.load(std::memory_order_relaxed)) {
+          return false;
+        }
+        // With parallel passes the recorder ended in a later command buffer
+        // than command_buffer_, and the frame's are submitted in the order
+        // they were recorded: M0, P0, M1, P1, ...
+        const VkCommandBuffer final_command_buffer =
+            parallel_pass_tail_ ? parallel_pass_tail_ : command_buffer_;
+        std::array<VkCommandBuffer, 1 + 2 * kParallelPassSegments> frame_command_buffers{};
+        uint32_t frame_command_buffer_count = 0;
+        frame_command_buffers[frame_command_buffer_count++] = command_buffer_;
+        for (uint32_t segment = 0; segment < parallel_pass_segment_count_; ++segment) {
+          const ParallelPassSlot& slot = parallel_pass_slots_[active_frame_slot_ & 1];
+          frame_command_buffers[frame_command_buffer_count++] = slot.pass_command_buffers[segment];
+          frame_command_buffers[frame_command_buffer_count++] = slot.main_command_buffers[segment];
+        }
+
         detail_callback_phase.Set(profile::CpuPhase::kFinalize);
         const uint64_t native_profile_finalize_begin =
             native_profile_frame_started ? rex::chrono::Clock::QueryHostTickCount() : 0;
-        SwitchNativeGpuProfileRange(command_buffer_, performance::GpuRange::kFrameRelease);
-        AcquireNativePresenterImage(command_buffer_);
+        SwitchNativeGpuProfileRange(final_command_buffer, performance::GpuRange::kFrameRelease);
+        AcquireNativePresenterImage(final_command_buffer);
         VkImageMemoryBarrier release_barrier{};
         release_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         release_barrier.srcAccessMask =
@@ -36832,22 +37331,22 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
         release_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         release_barrier.image = vulkan_context.image();
         release_barrier.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
-        profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] { return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(command_buffer_,
+        profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] { return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(final_command_buffer,
                                  presenter_transfer_written
                                      ? VK_PIPELINE_STAGE_TRANSFER_BIT
                                      : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask, 0, 0,
                                  nullptr, 0, nullptr, 1, &release_barrier); });
-        EndNativeGpuProfileFrame(command_buffer_);
+        EndNativeGpuProfileFrame(final_command_buffer);
 
         if (trace_stages) {
           REXLOG_WARN("gta4-native-stage: trace={} frame={} stage=command-buffer-end-begin",
                       trace_sequence, submitted_frame);
         }
 #if REX_PLATFORM_ANDROID
-        gpu_counters_.EndFrame(command_buffer_, active_frame_slot_);
+        gpu_counters_.EndFrame(final_command_buffer, active_frame_slot_);
 #endif
-        const VkResult end_result = profile::CpuCall(profile::CpuOp::kDriverEnd, [&] { return dfn.vkEndCommandBuffer(command_buffer_); });
+        const VkResult end_result = profile::CpuCall(profile::CpuOp::kDriverEnd, [&] { return dfn.vkEndCommandBuffer(final_command_buffer); });
         gpu_flight::Record("native.command-buffer-end", NativeVulkanHandleIdentity(command_buffer_),
                            submission_tracker_->GetCurrentSubmission(), submitted_frame,
                            active_frame_slot_, 0, int32_t(end_result));
@@ -36871,8 +37370,8 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
 
         VkSubmitInfo submit_info{};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit_info.commandBufferCount = 1;
-        submit_info.pCommandBuffers = &command_buffer_;
+        submit_info.commandBufferCount = frame_command_buffer_count;
+        submit_info.pCommandBuffers = frame_command_buffers.data();
         ui::vulkan::ImageAccessSubmit image_access_submit;
         if (!image_access_submit.Attach(submit_info, vulkan_context.image_access())) return false;
         const uint64_t submission = submission_tracker_->GetCurrentSubmission();
@@ -37464,6 +37963,7 @@ void Gta4NativeGraphicsSystem::DestroyVulkanWorkerObjects() {
       if (clear_render_pass_) {
         profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroyRenderPass(device, clear_render_pass_, nullptr); });
       }
+      DestroyParallelPassObjects();
       if (command_pool_) {
         profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroyCommandPool(device, command_pool_, nullptr); });
       }
@@ -37472,6 +37972,7 @@ void Gta4NativeGraphicsSystem::DestroyVulkanWorkerObjects() {
       }
     }
   }
+  StopParallelPassThread();
   clear_framebuffer_ = VK_NULL_HANDLE;
   clear_framebuffer_image_version_ = 0;
   clear_render_pass_ = VK_NULL_HANDLE;
